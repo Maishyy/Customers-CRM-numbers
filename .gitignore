@@ -27,3 +27,7 @@ Thumbs.db
 __pycache__/
 venv/secrets.toml 
 .streamlit/secrets.toml 
+
+# Secrets
+secrets.toml
+.streamlit/secrets.toml

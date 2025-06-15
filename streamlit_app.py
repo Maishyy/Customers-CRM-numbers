@@ -9,7 +9,7 @@ import json
 import os
 
 firebase_json = json.loads(st.secrets["firebase_creds"])
-cred = credentials.Certificate(firebase_json)
+cred = credentials.Certificate(firebase_json)   
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
