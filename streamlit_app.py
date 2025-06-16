@@ -153,3 +153,60 @@ if uploaded_files:
         st.dataframe(pd.read_excel(excel_file).head())
     else:
         st.warning("⚠️ No phone numbers found.")
+from datetime import datetime
+
+# --- Step 1: Helper to check if a number has been messaged today ---
+def has_been_messaged_today(phone):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    doc_id = f"{phone.replace('+', '')}_{today_str}"
+    doc_ref = db.collection("messages_sent").document(doc_id)
+    return doc_ref.get().exists
+
+# --- Step 2: Log message sent ---
+def log_message_sent(phone, name):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    doc_id = f"{phone.replace('+', '')}_{today_str}"
+    db.collection("messages_sent").document(doc_id).set({
+        "phone_number": phone,
+        "name": name,
+        "date": today_str,
+        "timestamp": firestore.SERVER_TIMESTAMP
+    })
+
+# --- Step 3: Prepare SMS List ---
+def get_eligible_sms_contacts():
+    contacts_ref = db.collection("contacts").stream()
+    to_message = []
+
+    for doc in contacts_ref:
+        data = doc.to_dict()
+        phone = data.get("phone_number")
+        name = data.get("client_name", "")
+        if phone and not has_been_messaged_today(phone):
+            to_message.append((phone, name))
+            log_message_sent(phone, name)  # Log as messaged now
+
+    return to_message
+
+# --- Step 4: Generate Excel for SMS contacts ---
+def generate_sms_excel(data):
+    df = pd.DataFrame(data, columns=["Phone Number", "Client Name"])
+    df["Date Messaged"] = datetime.now().strftime("%Y-%m-%d")
+    output = BytesIO()
+    df.to_excel(output, index=False, engine='openpyxl')
+    output.seek(0)
+    return output, df
+
+# --- Step 5: Streamlit UI ---
+st.header("📤 Prepare Daily SMS List")
+st.write("Generate and export numbers that haven't been messaged today.")
+
+if st.button("Generate Today's SMS List"):
+    sms_data = get_eligible_sms_contacts()
+    if sms_data:
+        sms_excel, sms_df = generate_sms_excel(sms_data)
+        st.success(f"Prepared {len(sms_data)} new contacts for messaging.")
+        st.download_button("📥 Download SMS List", data=sms_excel, file_name="todays_sms_list.xlsx")
+        st.dataframe(sms_df)
+    else:
+        st.warning("🎉 No new contacts to message today!")
