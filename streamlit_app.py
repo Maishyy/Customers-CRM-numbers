@@ -6,67 +6,59 @@ from io import BytesIO
 import firebase_admin
 from firebase_admin import credentials, firestore
 import json
-from datetime import datetime
 
-# --- Firebase Setup ---
+# --- Firebase Initialization ---
 firebase_json = json.loads(st.secrets["firebase_creds"])
 cred = credentials.Certificate(firebase_json)
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# --- Regex patterns ---
+# --- Constants ---
 PHONE_REGEX = r"(?:(?:\+254|254|0)?(7\d{8}|11\d{7}))"
 NAME_REGEX = r"([A-Z][A-Z]+\s+){1,}[A-Z][A-Z]+"
+EXCLUDE_KEYWORDS = ["CDM", "BANK", "TRANSFER", "CHEQUE"]
+BLACKLISTED_NUMBERS = ["+254722000000", "+254000000000"]
 
-# --- Helper to normalize and reject invalid numbers ---
+# --- Normalization & Filters ---
 def normalize_number(raw):
-    cleaned = f"+254{raw[-9:]}" if raw else None
-    blacklist = {
-        "+254700000000",
-        "+254722000000",
-        "+254123456789"
-    }
-    if cleaned in blacklist:
+    if not raw: return None
+    normalized = f"+254{raw[-9:]}"
+    if normalized in BLACKLISTED_NUMBERS or not normalized.startswith("+2547"):
         return None
-    return cleaned
+    return normalized
 
-# --- Extract Functions ---
+def should_exclude_line(line):
+    return any(keyword in line.upper() for keyword in EXCLUDE_KEYWORDS)
+
+# --- Extraction Logic ---
 def extract_from_text_lines(text_lines):
     records = []
-    blacklist_keywords = ["SALES", "CDM", "BANK TRANSFER", "CHEQUE", "WITHDRAWAL"]
     for line in text_lines:
-        if any(keyword in line.upper() for keyword in blacklist_keywords):
-            continue
+        if should_exclude_line(line): continue
         matches = re.findall(PHONE_REGEX, line)
-        if matches:
-            for match in matches:
-                phone = normalize_number(match)
-                if not phone:
-                    continue
-                after_number = re.split(match, line, maxsplit=1)[-1]
-                name_match = re.search(NAME_REGEX, after_number)
-                name = name_match.group(0).strip() if name_match else ""
-                records.append((phone, name))
+        for match in matches:
+            phone = normalize_number(match)
+            if not phone: continue
+            after_number = re.split(match, line, maxsplit=1)[-1]
+            name_match = re.search(NAME_REGEX, after_number)
+            name = name_match.group(0).strip() if name_match else ""
+            records.append((phone, name))
     return records
 
 def extract_from_dataframe(df):
     records = []
-    blacklist_keywords = ["SALES", "CDM", "BANK TRANSFER", "CHEQUE", "WITHDRAWAL"]
     for _, row in df.iterrows():
         row_text = " ".join(row.astype(str))
-        if any(keyword in row_text.upper() for keyword in blacklist_keywords):
-            continue
+        if should_exclude_line(row_text): continue
         matches = re.findall(PHONE_REGEX, row_text)
-        if matches:
-            for match in matches:
-                phone = normalize_number(match)
-                if not phone:
-                    continue
-                after_number = re.split(match, row_text, maxsplit=1)[-1]
-                name_match = re.search(NAME_REGEX, after_number)
-                name = name_match.group(0).strip() if name_match else ""
-                records.append((phone, name))
+        for match in matches:
+            phone = normalize_number(match)
+            if not phone: continue
+            after_number = re.split(match, row_text, maxsplit=1)[-1]
+            name_match = re.search(NAME_REGEX, after_number)
+            name = name_match.group(0).strip() if name_match else ""
+            records.append((phone, name))
     return records
 
 def process_pdf(file):
@@ -94,6 +86,7 @@ def process_excel(file):
             dfs = pd.read_excel(file, sheet_name=None, engine='openpyxl')
         except Exception:
             dfs = pd.read_excel(file, sheet_name=None, engine='xlrd')
+
         all_records = []
         for df in dfs.values():
             all_records.extend(extract_from_dataframe(df))
@@ -102,18 +95,23 @@ def process_excel(file):
         st.error(f"Error reading Excel: {e}")
         return []
 
+# --- Firebase Save Logic ---
 def save_to_firestore(data):
     collection = db.collection("contacts")
     new_count = 0
+
     for phone, name in data:
+        if not phone: continue
         doc_id = phone.replace("+", "")
         doc_ref = collection.document(doc_id)
+
         if not doc_ref.get().exists:
             first, last = "", ""
             if name:
                 split_name = name.strip().split(" ", 1)
                 first = split_name[0]
                 last = split_name[1] if len(split_name) > 1 else ""
+
             doc_ref.set({
                 "phone_number": phone,
                 "client_name": name,
@@ -125,56 +123,29 @@ def save_to_firestore(data):
             new_count += 1
     return new_count
 
+# --- Excel Output ---
 def generate_excel(data):
     unique = {(p, n) for p, n in data if p}
     df = pd.DataFrame(sorted(unique), columns=["Phone Number", "Client Name"])
     df[["First Name", "Last Name"]] = df["Client Name"].str.split(n=1, expand=True)
-    df["Phone (Raw)"] = df["Phone Number"].str.replace("+", "")
-    df["Phone (No Plus)"] = "254" + df["Phone Number"].str[-9:]
+    df["Phone (Raw)"] = df["Phone Number"].str.replace("+254", "")
+    df["Phone (254xxxxxxxxx)"] = df["Phone Number"].str.replace("+", "")
+    final_df = pd.DataFrame()
+    final_df["Firstname(optional)"] = df["First Name"]
+    final_df["Lastname(optional)"] = df["Last Name"]
+    final_df["Phone or Email"] = df["Phone Number"]
+    final_df["Phone (Raw)"] = df["Phone (Raw)"]
+    final_df["Phone (254 format)"] = df["Phone (254xxxxxxxxx)"]
+    final_df["Client Name (Original)"] = df["Client Name"]
     output = BytesIO()
-    df.to_excel(output, index=False, engine='openpyxl')
+    final_df.to_excel(output, index=False, engine='openpyxl')
     output.seek(0)
     return output
 
-def has_been_messaged_today(phone):
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    doc_id = f"{phone.replace('+', '')}_{today_str}"
-    return db.collection("messages_sent").document(doc_id).get().exists
-
-def log_message_sent(phone, name):
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    doc_id = f"{phone.replace('+', '')}_{today_str}"
-    db.collection("messages_sent").document(doc_id).set({
-        "phone_number": phone,
-        "name": name,
-        "date": today_str,
-        "timestamp": firestore.SERVER_TIMESTAMP
-    })
-
-def get_eligible_sms_contacts():
-    contacts_ref = db.collection("contacts").stream()
-    to_message = []
-    for doc in contacts_ref:
-        data = doc.to_dict()
-        phone = data.get("phone_number")
-        name = data.get("client_name", "")
-        if phone and not has_been_messaged_today(phone):
-            to_message.append((phone, name))
-            log_message_sent(phone, name)
-    return to_message
-
-def generate_sms_excel(data):
-    df = pd.DataFrame(data, columns=["Phone Number", "Client Name"])
-    df["Date Messaged"] = datetime.now().strftime("%Y-%m-%d")
-    df["Phone (No Plus)"] = "254" + df["Phone Number"].str[-9:]
-    output = BytesIO()
-    df.to_excel(output, index=False, engine='openpyxl')
-    output.seek(0)
-    return output, df
-
 # --- Streamlit UI ---
-st.title("\ud83d\udcde Extract + Sync to Firebase")
-st.write("Upload MPESA or bank statements (PDF, Excel, CSV). Extracted phone numbers with names will be saved to Firebase and downloadable as Excel.")
+st.title("Extract + Sync to Firebase")
+st.write("Upload MPESA or bank statements (PDF, Excel, CSV).")
+st.write("Filtered contacts will be saved to Firebase and downloadable as Excel.")
 
 uploaded_files = st.file_uploader("Upload files", type=["pdf", "csv", "xls", "xlsx"], accept_multiple_files=True)
 
@@ -182,7 +153,7 @@ if uploaded_files:
     all_data = []
     for file in uploaded_files:
         filename = file.name.lower()
-        st.write(f"Processing: `{file.name}`")
+        st.write(f"Processing: {file.name}")
         if filename.endswith(".pdf"):
             all_data.extend(process_pdf(file))
         elif filename.endswith(".csv"):
@@ -194,22 +165,10 @@ if uploaded_files:
 
     if all_data:
         new_count = save_to_firestore(all_data)
-        st.success(f"\u2705 Synced {len(set(all_data))} contacts. {new_count} new added.")
+        st.success(f"Synced {len(set(all_data))} contacts. {new_count} new added.")
         excel_file = generate_excel(all_data)
-        st.download_button("\ud83d\udcc5 Download Excel", data=excel_file, file_name="contacts.xlsx")
+        st.download_button("Download Excel", data=excel_file, file_name="contacts.xlsx")
+        st.write("Preview of uploaded data:")
         st.dataframe(pd.read_excel(excel_file).head())
     else:
-        st.warning("\u26a0\ufe0f No phone numbers found.")
-
-st.header("\ud83d\udce4 Prepare Daily SMS List")
-st.write("Generate and export numbers that haven't been messaged today.")
-
-if st.button("Generate Today's SMS List"):
-    sms_data = get_eligible_sms_contacts()
-    if sms_data:
-        sms_excel, sms_df = generate_sms_excel(sms_data)
-        st.success(f"Prepared {len(sms_data)} new contacts for messaging.")
-        st.download_button("\ud83d\udcc5 Download SMS List", data=sms_excel, file_name="todays_sms_list.xlsx")
-        st.dataframe(sms_df)
-    else:
-        st.warning("\ud83c\udf89 No new contacts to message today!")
+        st.warning("No valid phone numbers found.")
