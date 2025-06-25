@@ -111,7 +111,7 @@ def process_pdf(file):
                 progress_bar = st.progress(0)
                 total_pages = len(pdf.pages)
                 
-                for i, page in enumerate(tqdm(pdf.pages, desc="Processing PDF")):
+                for i, page in enumerate(pdf.pages):
                     text = page.extract_text()
                     if text:
                         records.extend(extract_from_text_lines(text.split("\n")))
@@ -134,7 +134,7 @@ def process_csv(file):
             chunksize = 10**5 if file_size > 5 else None  # Use chunks for files >5MB
             
             if chunksize:
-                for chunk in tqdm(pd.read_csv(file, chunksize=chunksize), desc="Processing CSV"):
+                for chunk in pd.read_csv(file, chunksize=chunksize):
                     records.extend(extract_from_dataframe(chunk))
             else:
                 df = pd.read_csv(file)
@@ -193,6 +193,9 @@ def save_to_firestore(data, dry_run=False):
         st.error("Database not initialized")
         return [], 0, 0, 0 if dry_run else (0, 0, 0)
         
+    if not data or not isinstance(data, list):
+        return [], 0, 0, 0 if dry_run else (0, 0, 0)
+        
     collection = db.collection("contacts")
     new_count = 0
     duplicate_count = 0
@@ -229,12 +232,14 @@ def save_to_firestore(data, dry_run=False):
             if dry_run:
                 # Dry run - check existence only
                 exists = doc_ref.get().exists
-                dry_run_results.append({
+                result = {
                     "Phone": phone,
                     "Name": name,
                     "Status": "Duplicate" if exists else "New",
                     "Exists": exists
-                })
+                }
+                dry_run_results.append(result)
+                
                 if exists:
                     duplicate_count += 1
                 else:
@@ -266,8 +271,17 @@ def save_to_firestore(data, dry_run=False):
             error_count += 1
             logger.error(f"Error processing {phone}: {str(e)}")
             if dry_run:
-                dry_run_results[-1]["Status"] = "Error"
-                dry_run_results[-1]["Error"] = str(e)
+                # Create new error entry if list is empty, otherwise update last entry
+                error_entry = {
+                    "Phone": phone,
+                    "Name": name,
+                    "Status": "Error",
+                    "Error": str(e)
+                }
+                if dry_run_results:
+                    dry_run_results[-1].update(error_entry)
+                else:
+                    dry_run_results.append(error_entry)
     
     progress_bar.empty()
     status_text.empty()
@@ -599,18 +613,4 @@ with tabs[2]:
 
 # --- Footer ---
 st.markdown("---")
-st.markdown(
-    """
-    <style>
-    .footer {
-        font-size: small;
-        color: gray;
-        text-align: center;
-    }
-    </style>
-    <div class="footer">
-    Contact Management System • v1.1 • Last updated: {date}
-    </div>
-    """.format(date=datetime.now().strftime("%Y-%m-%d")),
-    unsafe_allow_html=True
-)
+st.caption(f"Contact Management System • v1.2 • Last updated: {datetime.now().strftime('%Y-%m-%d')}")
