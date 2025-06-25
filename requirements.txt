@@ -4,3 +4,6 @@ openpyxl
 xlrd
 pdfplumber
 firebase-admin
+altair
+tqdm
+
