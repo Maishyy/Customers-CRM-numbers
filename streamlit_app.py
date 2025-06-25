@@ -25,11 +25,11 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 PHONE_REGEX = r"(?:(?:\+254|254|0)?(7\d{8}|11\d{7}))"
-NAME_REGEX = r"([A-Za-z][A-Za-z]+\s+){1,}[A-Za-z][A-Za-z]+"  # More inclusive name matching
+NAME_REGEX = r"([A-Za-z][A-Za-z]+\s+){1,}[A-Za-z][A-Za-z]+"
 EXCLUDE_KEYWORDS = ["CDM", "BANK", "TRANSFER", "CHEQUE", "DEPOSIT"]
 BLACKLISTED_NUMBERS = ["+254722000000", "+254000000000"]
-DRY_RUN_MAX_DISPLAY = 100  # Max records to display in dry run
-MAX_FILE_SIZE_MB = 10  # Maximum file size allowed
+DRY_RUN_MAX_DISPLAY = 100
+MAX_FILE_SIZE_MB = 10
 
 # --- Firebase Initialization ---
 def initialize_firebase():
@@ -40,7 +40,6 @@ def initialize_firebase():
                 cred = credentials.Certificate(firebase_json)
                 firebase_admin.initialize_app(cred)
             else:
-                # For local testing without secrets.toml
                 cred = credentials.Certificate('firebase-creds.json')
                 firebase_admin.initialize_app(cred)
         return firestore.client()
@@ -52,6 +51,19 @@ def initialize_firebase():
 db = initialize_firebase()
 
 # --- Utility Functions ---
+def validate_file(file):
+    """Validate file object has required attributes"""
+    if not file or not hasattr(file, 'name') or not hasattr(file, 'read'):
+        logger.warning("Invalid file object received")
+        return False
+    return True
+
+def check_file_size(file):
+    """Check if file size is within limits"""
+    if not hasattr(file, 'size'):
+        return False
+    return file.size <= MAX_FILE_SIZE_MB * 1024 * 1024
+
 def normalize_number(raw):
     """Normalize phone numbers to +254 format"""
     if not raw: 
@@ -87,14 +99,12 @@ def extract_from_text_lines(text_lines):
         if not line or should_exclude_line(line): 
             continue
             
-        # Find all phone matches in the line
         matches = re.finditer(PHONE_REGEX, line)
         for match in matches:
             phone = normalize_number(match.group())
             if not phone: 
                 continue
                 
-            # Extract name after the phone number
             after_number = line[match.end():].strip()
             name_match = re.search(NAME_REGEX, after_number)
             name = name_match.group(0).strip() if name_match else ""
@@ -129,9 +139,8 @@ def process_csv(file):
     records = []
     try:
         with st.spinner(f"Processing {file.name}..."):
-            # Try to determine file size for chunking
             file_size = file.size / (1024 * 1024)  # MB
-            chunksize = 10**5 if file_size > 5 else None  # Use chunks for files >5MB
+            chunksize = 10**5 if file_size > 5 else None
             
             if chunksize:
                 for chunk in pd.read_csv(file, chunksize=chunksize):
@@ -230,7 +239,6 @@ def save_to_firestore(data, dry_run=False):
             status_text.text(f"Processing {i+1}/{total} - {phone}")
             
             if dry_run:
-                # Dry run - check existence only
                 exists = doc_ref.get().exists
                 result = {
                     "Phone": phone,
@@ -245,7 +253,6 @@ def save_to_firestore(data, dry_run=False):
                 else:
                     new_count += 1
             else:
-                # Actual save operation
                 if not doc_ref.get().exists:
                     first, last = "", ""
                     if name:
@@ -271,7 +278,6 @@ def save_to_firestore(data, dry_run=False):
             error_count += 1
             logger.error(f"Error processing {phone}: {str(e)}")
             if dry_run:
-                # Create new error entry if list is empty, otherwise update last entry
                 error_entry = {
                     "Phone": phone,
                     "Name": name,
@@ -429,36 +435,41 @@ with tabs[0]:
     )
     
     if uploaded_files:
-        # Check file sizes
-        oversized_files = [
-            f.name for f in uploaded_files 
-            if f.size > MAX_FILE_SIZE_MB * 1024 * 1024
-        ]
+        # Validate files
+        valid_files = []
+        for f in uploaded_files:
+            if validate_file(f) and check_file_size(f):
+                valid_files.append(f)
+            else:
+                st.warning(f"Skipping invalid or oversized file: {getattr(f, 'name', 'unknown')}")
         
-        if oversized_files:
-            st.error(f"Files exceed size limit ({MAX_FILE_SIZE_MB}MB): {', '.join(oversized_files)}")
+        if not valid_files:
+            st.error("No valid files to process")
         else:
             all_data = []
-            total_files = len(uploaded_files)
+            total_files = len(valid_files)
             
             with st.expander("Processing Progress", expanded=True):
                 file_progress = st.progress(0)
                 file_status = st.empty()
                 
-                for i, file in enumerate(uploaded_files):
-                    file_status.text(f"Processing {i+1}/{total_files}: {file.name}")
-                    
+                for i, file in enumerate(valid_files):
                     try:
-                        if file.name.lower().endswith(".pdf"):
+                        file_status.text(f"Processing {i+1}/{total_files}: {file.name}")
+                        file_ext = file.name.lower().split('.')[-1]
+                        
+                        if file_ext == "pdf":
                             all_data.extend(process_pdf(file))
-                        elif file.name.lower().endswith(".csv"):
+                        elif file_ext == "csv":
                             all_data.extend(process_csv(file))
-                        elif file.name.lower().endswith((".xls", ".xlsx")):
+                        elif file_ext in ("xls", "xlsx"):
                             all_data.extend(process_excel(file))
                         else:
-                            st.warning(f"Unsupported file format: {file.name}")
+                            st.warning(f"Unsupported file type: {file_ext}")
+                            
                     except Exception as e:
-                        st.error(f"Error processing {file.name}: {e}")
+                        logger.error(f"Error processing file {file.name}: {str(e)}")
+                        st.error(f"Failed to process {file.name}: {str(e)}")
                     
                     file_progress.progress((i + 1) / total_files)
                 
@@ -469,24 +480,20 @@ with tabs[0]:
                 st.info(f"Found {len(all_data)} raw contacts before deduplication")
                 
                 if dry_run:
-                    # Dry run execution
                     dry_run_results, new_count, dup_count, error_count = save_to_firestore(
                         all_data, dry_run=True
                     )
                     
-                    # Display dry run results
                     st.subheader("Dry Run Preview")
                     col1, col2, col3 = st.columns(3)
                     col1.metric("Would Add New", new_count)
                     col2.metric("Would Skip Duplicates", dup_count)
                     col3.metric("Would Error", error_count)
                     
-                    # Show sample records
                     st.write(f"Sample records (first {min(DRY_RUN_MAX_DISPLAY, len(dry_run_results))} shown):")
                     dry_run_df = pd.DataFrame(dry_run_results)
                     st.dataframe(dry_run_df.head(DRY_RUN_MAX_DISPLAY))
                     
-                    # Add option to proceed with real upload
                     if st.button("✅ Proceed with Actual Upload"):
                         with st.spinner("Uploading contacts..."):
                             new_count, dup_count, error_count = save_to_firestore(all_data)
@@ -495,7 +502,6 @@ with tabs[0]:
                                 f"New: {new_count}, Duplicates: {dup_count}, Errors: {error_count}"
                             )
                 else:
-                    # Normal execution
                     with st.spinner("Uploading contacts..."):
                         new_count, dup_count, error_count = save_to_firestore(all_data)
                         st.success(
@@ -503,7 +509,6 @@ with tabs[0]:
                             f"New: {new_count}, Duplicates: {dup_count}, Errors: {error_count}"
                         )
                 
-                # Download option
                 excel_file, df = generate_sms_excel(all_data)
                 st.download_button(
                     "📥 Download Processed Contacts", 
@@ -542,7 +547,6 @@ with tabs[1]:
 with tabs[2]:
     st.header("Messaging Dashboard")
     
-    # Date range selector
     col1, col2 = st.columns(2)
     with col1:
         days_back = st.slider(
@@ -559,7 +563,6 @@ with tabs[2]:
     if not df.empty:
         df["date"] = pd.to_datetime(df["date"])
         
-        # Summary metrics
         st.subheader("📊 Summary Statistics")
         today = pd.to_datetime("today").normalize()
         
@@ -574,7 +577,6 @@ with tabs[2]:
         )
         col3.metric("Total Messages", df.shape[0])
         
-        # Time series chart
         st.subheader("📈 Messages Over Time")
         daily_counts = df.groupby(df["date"].dt.date).size().reset_index(name="Count")
         
@@ -588,7 +590,6 @@ with tabs[2]:
         )
         st.altair_chart(chart, use_container_width=True)
         
-        # Top contacts
         st.subheader("🏆 Top Messaged Contacts")
         top_n = st.slider("Show top N contacts", 5, 20, 10)
         top_contacts = df["phone"].value_counts().nlargest(top_n).reset_index()
@@ -604,7 +605,6 @@ with tabs[2]:
         )
         st.altair_chart(bar_chart, use_container_width=True)
         
-        # Raw data
         if show_raw_data:
             st.subheader("📝 Raw Message Data")
             st.dataframe(df.sort_values("date", ascending=False))
