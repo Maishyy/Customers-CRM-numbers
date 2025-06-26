@@ -1,3 +1,4 @@
+# streamlit_app.py
 import re
 import pandas as pd
 import streamlit as st
@@ -135,19 +136,12 @@ def log_message_sent(phone, name):
     })
 
 def was_messaged_within_last_7_days(phone):
-    messages_ref = db.collection("messages_sent")\
+    cutoff_date = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+    messages = db.collection("messages_sent")\
         .where("phone_number", "==", phone)\
-        .order_by("timestamp", direction=firestore.Query.DESCENDING)\
+        .where("date", ">=", cutoff_date)\
         .limit(1).stream()
-
-    for doc in messages_ref:
-        data = doc.to_dict()
-        last_ts = data.get("timestamp")
-        if last_ts:
-            last_time = last_ts.replace(tzinfo=None)
-            if datetime.utcnow() - last_time < timedelta(days=7):
-                return True
-    return False
+    return any(True for _ in messages)
 
 def get_eligible_sms_contacts():
     contacts_ref = db.collection("contacts").stream()
