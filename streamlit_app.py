@@ -22,7 +22,7 @@ NAME_REGEX = r"([A-Z][A-Z]+\s+){1,}[A-Z][A-Z]+"
 EXCLUDE_KEYWORDS = ["CDM", "BANK", "TRANSFER", "CHEQUE"]
 BLACKLISTED_NUMBERS = ["+254722000000", "+254000000000"]
 
-# --- Utils ---
+# --- Helpers ---
 def normalize_number(raw):
     if not raw: return None
     normalized = f"+254{raw[-9:]}"
@@ -33,6 +33,7 @@ def normalize_number(raw):
 def should_exclude_line(line):
     return any(keyword in line.upper() for keyword in EXCLUDE_KEYWORDS)
 
+# --- Extractors ---
 def extract_from_text_lines(text_lines):
     records = []
     for line in text_lines:
@@ -83,16 +84,19 @@ def process_csv(file):
 
 def process_excel(file):
     try:
-        dfs = pd.read_excel(file, sheet_name=None, engine="openpyxl")
+        if file.name.endswith(".xls"):
+            dfs = pd.read_excel(file, sheet_name=None, engine="xlrd")
+        else:
+            dfs = pd.read_excel(file, sheet_name=None, engine="openpyxl")
         all_records = []
         for df in dfs.values():
             all_records.extend(extract_from_dataframe(df))
         return all_records
     except Exception as e:
-        st.error(f"Error reading Excel: {e}")
+        st.error(f"Error reading Excel file '{file.name}': {e}")
         return []
 
-# --- Firebase ---
+# --- Firebase Logic ---
 def save_to_firestore(data):
     collection = db.collection("contacts")
     new_count = 0
@@ -181,12 +185,12 @@ def load_message_logs():
         })
     return pd.DataFrame(records)
 
-# --- Streamlit Tabs ---
+# --- Streamlit UI ---
 st.title("Sequid Hardware Contact System")
 
 tabs = st.tabs(["Upload & Sync", "Daily SMS List", "Dashboard"])
 
-# --- TAB 1: UPLOAD ---
+# --- Tab 1: Upload ---
 with tabs[0]:
     st.subheader("Upload MPESA or Bank Statements")
     uploaded_files = st.file_uploader("Upload files", type=["pdf", "csv", "xls", "xlsx"], accept_multiple_files=True)
@@ -214,9 +218,9 @@ with tabs[0]:
         else:
             st.warning("No valid phone numbers found.")
 
-# --- TAB 2: DAILY SMS LIST ---
+# --- Tab 2: Daily SMS List ---
 with tabs[1]:
-    st.subheader("Generate Daily SMS List (One message per 7 days per contact)")
+    st.subheader("Generate Daily SMS List (only message once per 7 days)")
     if st.button("Generate Today's List"):
         sms_data = get_eligible_sms_contacts()
         if sms_data:
@@ -227,7 +231,7 @@ with tabs[1]:
         else:
             st.info("No new contacts to message today.")
 
-# --- TAB 3: DASHBOARD ---
+# --- Tab 3: Dashboard ---
 with tabs[2]:
     st.subheader("Message History Dashboard")
     df_logs = load_message_logs()
@@ -235,21 +239,22 @@ with tabs[2]:
     if df_logs.empty:
         st.info("No message logs found.")
     else:
-        # --- Summary ---
+        # Metrics
         st.metric("Total Messages Sent", len(df_logs))
         recent = df_logs["Date Messaged"].value_counts().sort_index()
         st.bar_chart(recent)
 
-        # --- Pie Chart of Top Contacts ---
+        # Pie Chart of Top 10
         top_contacts = df_logs["Phone"].value_counts().nlargest(10)
         fig, ax = plt.subplots()
         top_contacts.plot.pie(autopct='%1.0f%%', startangle=90, ax=ax)
         ax.set_ylabel('')
         st.pyplot(fig)
 
-        # --- Log Table ---
+        # Table
         st.markdown("### Message Log")
         st.dataframe(df_logs.sort_values("Date Messaged", ascending=False))
 
+        # Download
         csv = df_logs.to_csv(index=False).encode("utf-8")
         st.download_button("Download Full Log CSV", data=csv, file_name="message_log.csv")
