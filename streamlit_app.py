@@ -265,6 +265,35 @@ with tabs[1]:
             st.dataframe(sms_df)
         else:
             st.info("No new contacts to message today.")
+            @st.cache_data
+def load_message_logs():
+    try:
+        collection_ref = db.collection("message_logs")
+        docs = collection_ref.stream()
+
+        data = []
+        for doc in docs:
+            doc_data = doc.to_dict()
+            phone = doc_data.get("phone_number", "")
+            date = doc_data.get("timestamp")
+
+            if isinstance(date, datetime):
+                date_formatted = date.strftime("%Y-%m-%d")
+            else:
+                date_formatted = ""
+
+            data.append({
+                "Phone": phone,
+                "Date Messaged": date_formatted
+            })
+
+        return pd.DataFrame(data)
+
+    except Exception as e:
+        logger.error(f"Error loading message logs: {str(e)}")
+        st.error("Failed to load message logs.")
+        return pd.DataFrame(columns=["Phone", "Date Messaged"])
+
 
 # --- Tab 3: Dashboard ---
 with tabs[2]:
