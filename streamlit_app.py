@@ -3,209 +3,253 @@ import pandas as pd
 import streamlit as st
 import pdfplumber
 from io import BytesIO
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import json
 import firebase_admin
 from firebase_admin import credentials, firestore
-import json
-from datetime import datetime, timedelta
-import altair as alt
-import logging
-from collections import defaultdict
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(), logging.FileHandler('app.log')]
-)
-logger = logging.getLogger(__name__)
+# --- Firebase Setup ---
+firebase_json = json.loads(st.secrets["firebase_creds"])
+cred = credentials.Certificate(firebase_json)
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(cred)
+db = firestore.client()
 
-# Constants
+# --- Constants ---
 PHONE_REGEX = r"(?:(?:\+254|254|0)?(7\d{8}|11\d{7}))"
 NAME_REGEX = r"([A-Z][A-Z]+\s+){1,}[A-Z][A-Z]+"
 EXCLUDE_KEYWORDS = ["CDM", "BANK", "TRANSFER", "CHEQUE"]
 BLACKLISTED_NUMBERS = ["+254722000000", "+254000000000"]
-MAX_FILE_SIZE_MB = 10
 
-# Initialize Firebase
-def init_firebase():
-    try:
-        if not firebase_admin._apps:
-            if 'firebase_creds' in st.secrets:
-                cred = credentials.Certificate(json.loads(st.secrets["firebase_creds"]))
-            else:
-                cred = credentials.Certificate('firebase-creds.json')
-            firebase_admin.initialize_app(cred)
-        return firestore.client()
-    except Exception as e:
-        logger.error(f"Firebase init error: {str(e)}")
-        st.error("Firebase initialization failed")
-        return None
-
-db = init_firebase()
-
-# Core Phone Processing Functions
-def normalize_phone(raw):
+# --- Utils ---
+def normalize_number(raw):
     if not raw: return None
-    try:
-        digits = re.sub(r'[^\d]', '', raw)
-        if len(digits) == 9 and digits.startswith('7'):
-            normalized = f"+254{digits}"
-        elif len(digits) == 12 and digits.startswith('254'):
-            normalized = f"+{digits}"
-        elif len(digits) == 10 and digits.startswith('0'):
-            normalized = f"+254{digits[1:]}"
-        else:
-            return None
-            
-        return normalized if normalized not in BLACKLISTED_NUMBERS and normalized.startswith("+2547") else None
-    except Exception:
+    normalized = f"+254{raw[-9:]}"
+    if normalized in BLACKLISTED_NUMBERS or not normalized.startswith("+2547"):
         return None
+    return normalized
 
-def should_exclude(text):
-    return any(kw in text.upper() for kw in EXCLUDE_KEYWORDS) if isinstance(text, str) else True
+def should_exclude_line(line):
+    return any(keyword in line.upper() for keyword in EXCLUDE_KEYWORDS)
 
-def extract_contacts(text):
+def extract_from_text_lines(text_lines):
     records = []
-    for match in re.finditer(PHONE_REGEX, text):
-        phone = normalize_phone(match.group())
-        if not phone: continue
-        
-        after_num = text[match.end():].strip()
-        name_match = re.search(NAME_REGEX, after_num)
-        name = name_match.group(0).strip() if name_match else ""
-        
-        records.append((phone, name))
+    for line in text_lines:
+        if should_exclude_line(line): continue
+        matches = re.findall(PHONE_REGEX, line)
+        for match in matches:
+            phone = normalize_number(match)
+            if not phone: continue
+            after_number = re.split(match, line, maxsplit=1)[-1]
+            name_match = re.search(NAME_REGEX, after_number)
+            name = name_match.group(0).strip() if name_match else ""
+            records.append((phone, name))
     return records
 
-# File Processing
+def extract_from_dataframe(df):
+    records = []
+    for _, row in df.iterrows():
+        row_text = " ".join(row.astype(str))
+        if should_exclude_line(row_text): continue
+        matches = re.findall(PHONE_REGEX, row_text)
+        for match in matches:
+            phone = normalize_number(match)
+            if not phone: continue
+            after_number = re.split(match, row_text, maxsplit=1)[-1]
+            name_match = re.search(NAME_REGEX, after_number)
+            name = name_match.group(0).strip() if name_match else ""
+            records.append((phone, name))
+    return records
+
 def process_pdf(file):
+    records = []
     try:
         with pdfplumber.open(file) as pdf:
-            return [contact for page in pdf.pages 
-                    if (text := page.extract_text()) 
-                    for contact in extract_contacts(text)]
+            for page in pdf.pages:
+                lines = page.extract_text().split("\n")
+                records.extend(extract_from_text_lines(lines))
     except Exception as e:
-        logger.error(f"PDF error: {str(e)}")
-        st.error(f"PDF processing failed: {e}")
-        return []
+        st.error(f"Error reading PDF: {e}")
+    return records
 
 def process_csv(file):
     try:
         df = pd.read_csv(file)
-        return [(normalize_phone(str(num)), name) 
-                for num, name in df.values 
-                if not should_exclude(str(num))]
+        return extract_from_dataframe(df)
     except Exception as e:
-        logger.error(f"CSV error: {str(e)}")
-        st.error(f"CSV processing failed: {e}")
+        st.error(f"Error reading CSV: {e}")
         return []
 
 def process_excel(file):
     try:
-        dfs = pd.read_excel(file, sheet_name=None, engine='openpyxl')
-        return [contact for df in dfs.values() 
-                for contact in extract_from_dataframe(df)]
+        dfs = pd.read_excel(file, sheet_name=None, engine="openpyxl")
+        all_records = []
+        for df in dfs.values():
+            all_records.extend(extract_from_dataframe(df))
+        return all_records
     except Exception as e:
-        logger.error(f"Excel error: {str(e)}")
-        st.error(f"Excel processing failed: {e}")
+        st.error(f"Error reading Excel: {e}")
         return []
 
-def extract_from_dataframe(df):
-    return [contact for _, row in df.iterrows() 
-            if not should_exclude(str(row))
-            for contact in extract_contacts(" ".join(str(x) for x in row if pd.notna(x)))]
-
-# Firebase Operations
-def save_contacts(contacts, dry_run=False):
-    if not db: return [], 0, 0, 0
-    
+# --- Firebase ---
+def save_to_firestore(data):
     collection = db.collection("contacts")
-    results = []
-    new = dup = err = 0
-    
-    for phone, name in contacts:
+    new_count = 0
+
+    for phone, name in data:
         if not phone: continue
-        
-        try:
-            doc_ref = collection.document(phone.replace("+", ""))
-            exists = doc_ref.get().exists
-            
-            if dry_run:
-                results.append({
-                    "Phone": phone,
-                    "Name": name,
-                    "Status": "Duplicate" if exists else "New"
-                })
-            elif not exists:
-                first, last = (name.split(" ", 1) + [""])[:2]
-                doc_ref.set({
-                    "phone_number": phone,
-                    "client_name": name,
-                    "first_name": first,
-                    "last_name": last,
-                    "timestamp": firestore.SERVER_TIMESTAMP
-                })
-            
-            dup += exists
-            new += not exists
-        except Exception as e:
-            err += 1
-            logger.error(f"Save error: {phone} - {str(e)}")
-            if dry_run:
-                results[-1]["Status"] = "Error"
-                results[-1]["Error"] = str(e)
-    
-    return (results, new, dup, err) if dry_run else (new, dup, err)
+        doc_id = phone.replace("+", "")
+        doc_ref = collection.document(doc_id)
 
-# Streamlit UI
-def main():
-    st.set_page_config(layout="wide", page_title="Contact Manager")
-    
-    tabs = st.tabs(["Upload", "SMS List", "Dashboard"])
-    
-    with tabs[0]:
-        st.header("Upload Contacts")
-        dry_run = st.checkbox("Dry Run Mode", True)
-        
-        files = st.file_uploader("Upload files", 
-                               type=["pdf", "csv", "xlsx"], 
-                               accept_multiple_files=True)
-        
-        if files:
-            contacts = []
-            for file in files:
-                ext = file.name.split(".")[-1].lower()
-                if ext == "pdf":
-                    contacts.extend(process_pdf(file))
-                elif ext == "csv":
-                    contacts.extend(process_csv(file))
-                elif ext in ("xls", "xlsx"):
-                    contacts.extend(process_excel(file))
-            
-            if contacts:
-                if dry_run:
-                    results, new, dup, err = save_contacts(contacts, True)
-                    st.dataframe(pd.DataFrame(results).head(50))
-                else:
-                    new, dup, err = save_contacts(contacts)
-                
-                st.success(f"Processed {len(contacts)} contacts")
-                st.download_button(
-                    "Download Results",
-                    pd.DataFrame(contacts).to_csv().encode(),
-                    "contacts.csv"
-                )
-    
-    with tabs[1]:
-        st.header("SMS List Generator")
-        if st.button("Generate List"):
-            # Implement SMS list generation
-            pass
-    
-    with tabs[2]:
-        st.header("Dashboard")
-        # Implement dashboard
-        pass
+        if not doc_ref.get().exists:
+            first, last = "", ""
+            if name:
+                split_name = name.strip().split(" ", 1)
+                first = split_name[0]
+                last = split_name[1] if len(split_name) > 1 else ""
 
-if __name__ == "__main__":
-    main()
+            doc_ref.set({
+                "phone_number": phone,
+                "client_name": name,
+                "first_name": first,
+                "last_name": last,
+                "source": "upload",
+                "timestamp": firestore.SERVER_TIMESTAMP
+            })
+            new_count += 1
+    return new_count
+
+def log_message_sent(phone, name):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    doc_id = f"{phone.replace('+', '')}_{today_str}"
+    db.collection("messages_sent").document(doc_id).set({
+        "phone_number": phone,
+        "name": name,
+        "date": today_str,
+        "timestamp": firestore.SERVER_TIMESTAMP
+    })
+
+def was_messaged_within_last_7_days(phone):
+    messages_ref = db.collection("messages_sent")\
+        .where("phone_number", "==", phone)\
+        .order_by("timestamp", direction=firestore.Query.DESCENDING)\
+        .limit(1).stream()
+
+    for doc in messages_ref:
+        data = doc.to_dict()
+        last_ts = data.get("timestamp")
+        if last_ts:
+            last_time = last_ts.replace(tzinfo=None)
+            if datetime.utcnow() - last_time < timedelta(days=7):
+                return True
+    return False
+
+def get_eligible_sms_contacts():
+    contacts_ref = db.collection("contacts").stream()
+    to_message = []
+
+    for doc in contacts_ref:
+        data = doc.to_dict()
+        phone = data.get("phone_number")
+        name = data.get("client_name", "")
+        if phone and not was_messaged_within_last_7_days(phone):
+            to_message.append((phone, name))
+            log_message_sent(phone, name)
+    return to_message
+
+def generate_excel(data):
+    unique = {(p, n) for p, n in data if p}
+    df = pd.DataFrame(sorted(unique), columns=["Phone Number", "Client Name"])
+    df[["First Name", "Last Name"]] = df["Client Name"].str.split(n=1, expand=True)
+    df["Phone (Raw)"] = df["Phone Number"].str.replace("+254", "")
+    df["Phone (254xxxxxxxxx)"] = df["Phone Number"].str.replace("+", "")
+    output = BytesIO()
+    df.to_excel(output, index=False, engine="openpyxl")
+    output.seek(0)
+    return output, df
+
+def load_message_logs():
+    docs = db.collection("messages_sent").stream()
+    records = []
+    for doc in docs:
+        data = doc.to_dict()
+        records.append({
+            "Phone": data.get("phone_number", ""),
+            "Name": data.get("name", ""),
+            "Date Messaged": data.get("date", ""),
+        })
+    return pd.DataFrame(records)
+
+# --- Streamlit Tabs ---
+st.title("Sequid Hardware Contact System")
+
+tabs = st.tabs(["Upload & Sync", "Daily SMS List", "Dashboard"])
+
+# --- TAB 1: UPLOAD ---
+with tabs[0]:
+    st.subheader("Upload MPESA or Bank Statements")
+    uploaded_files = st.file_uploader("Upload files", type=["pdf", "csv", "xls", "xlsx"], accept_multiple_files=True)
+
+    if uploaded_files:
+        all_data = []
+        for file in uploaded_files:
+            filename = file.name.lower()
+            st.write(f"Processing: {file.name}")
+            if filename.endswith(".pdf"):
+                all_data.extend(process_pdf(file))
+            elif filename.endswith(".csv"):
+                all_data.extend(process_csv(file))
+            elif filename.endswith((".xls", ".xlsx")):
+                all_data.extend(process_excel(file))
+            else:
+                st.warning(f"Unsupported file format: {file.name}")
+
+        if all_data:
+            new_count = save_to_firestore(all_data)
+            st.success(f"Synced {len(set(all_data))} contacts. {new_count} new added.")
+            excel_file, df = generate_excel(all_data)
+            st.download_button("Download Excel", data=excel_file, file_name="contacts.xlsx")
+            st.dataframe(df.head())
+        else:
+            st.warning("No valid phone numbers found.")
+
+# --- TAB 2: DAILY SMS LIST ---
+with tabs[1]:
+    st.subheader("Generate Daily SMS List (One message per 7 days per contact)")
+    if st.button("Generate Today's List"):
+        sms_data = get_eligible_sms_contacts()
+        if sms_data:
+            sms_excel, sms_df = generate_excel(sms_data)
+            st.success(f"Prepared {len(sms_data)} new contacts for messaging.")
+            st.download_button("Download SMS List", data=sms_excel, file_name="todays_sms_list.xlsx")
+            st.dataframe(sms_df)
+        else:
+            st.info("No new contacts to message today.")
+
+# --- TAB 3: DASHBOARD ---
+with tabs[2]:
+    st.subheader("Message History Dashboard")
+    df_logs = load_message_logs()
+
+    if df_logs.empty:
+        st.info("No message logs found.")
+    else:
+        # --- Summary ---
+        st.metric("Total Messages Sent", len(df_logs))
+        recent = df_logs["Date Messaged"].value_counts().sort_index()
+        st.bar_chart(recent)
+
+        # --- Pie Chart of Top Contacts ---
+        top_contacts = df_logs["Phone"].value_counts().nlargest(10)
+        fig, ax = plt.subplots()
+        top_contacts.plot.pie(autopct='%1.0f%%', startangle=90, ax=ax)
+        ax.set_ylabel('')
+        st.pyplot(fig)
+
+        # --- Log Table ---
+        st.markdown("### Message Log")
+        st.dataframe(df_logs.sort_values("Date Messaged", ascending=False))
+
+        csv = df_logs.to_csv(index=False).encode("utf-8")
+        st.download_button("Download Full Log CSV", data=csv, file_name="message_log.csv")
