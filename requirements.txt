@@ -6,4 +6,4 @@ pdfplumber
 firebase-admin
 altair
 tqdm
-
+matplotlib
