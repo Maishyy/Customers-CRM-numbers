@@ -11,6 +11,7 @@ from firebase_admin import credentials, firestore
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import logging
+import os
 
 # Configure logging
 logging.basicConfig(
@@ -21,25 +22,49 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Firebase Setup ---
-try:
-    firebase_json = json.loads(st.secrets["firebase_creds"])
-    cred = credentials.Certificate(firebase_json)
+TEST_MODE = st.sidebar.checkbox("Enable Test Mode", help="Use local Firebase emulator")
+
+if TEST_MODE:
+    os.environ["FIRESTORE_EMULATOR_HOST"] = "localhost:8080"
     if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred)
+        firebase_admin.initialize_app(credentials.Certificate("local_test_creds.json"))
     db = firestore.client()
-except Exception as e:
-    logger.error(f"Firebase initialization failed: {str(e)}")
-    st.error("Failed to initialize Firebase. Check logs for details.")
-    st.stop()
+    st.sidebar.warning("TEST MODE ACTIVE - Using local emulator")
+else:
+    try:
+        firebase_json = json.loads(st.secrets["firebase_creds"])
+        cred = credentials.Certificate(firebase_json)
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+        db = firestore.client()
+    except Exception as e:
+        logger.error(f"Firebase initialization failed: {str(e)}")
+        st.error("Failed to initialize Firebase. Check logs for details.")
+        st.stop()
 
 # --- Constants ---
-PHONE_REGEX = r"(?:(?:\+254|254|0)?(7\d{8}|11\d{7}))"
-NAME_REGEX = r"([A-Z][A-Z]+\s+){1,}[A-Z][A-Z]+"
+PHONE_REGEX = r"(?:(?:\+?254|0)?(7[0-9]{2}|1[0-1][0-9])(?:[0-9]{6}))"
+NAME_REGEX = r"(?:[A-Z][A-Z]+(?:\s+[A-Z][A-Z]+)+)(?=\s*(?:\d|[-+]|$))"
 EXCLUDE_KEYWORDS = ["CDM", "BANK", "TRANSFER", "CHEQUE"]
 BLACKLISTED_NUMBERS = ["+254722000000", "+254000000000"]
 MAX_FILE_SIZE_MB = 10
 
-# --- Normalize Numbers ---
+# --- Helper Functions ---
+def format_phone_number(phone):
+    """Ensure phone is in 254 format"""
+    if not phone:
+        return ""
+    phone = str(phone).strip()
+    phone = phone.replace("+", "").replace(" ", "")
+    
+    if phone.startswith("0") and len(phone) == 10:
+        return "254" + phone[1:]
+    elif phone.startswith("7") and len(phone) == 9:
+        return "254" + phone
+    elif phone.startswith("254") and len(phone) == 12:
+        return phone
+    return phone
+
 def normalize_number(raw):
     if not raw or not isinstance(raw, str):
         return None
@@ -64,29 +89,16 @@ def should_exclude_line(line):
         return True
     return any(keyword in line.upper() for keyword in EXCLUDE_KEYWORDS)
 
+def validate_contact(phone, name):
+    if not phone or len(phone) != 13 or not phone.startswith("+2547"):
+        return False
+    if name:
+        name_parts = name.split()
+        if len(name_parts) < 2 or any(len(part) < 2 for part in name_parts):
+            return False
+    return True
+
 # --- File Processors ---
-def process_file(file):
-    try:
-        ext = file.name.lower().split('.')[-1]
-        if ext == "pdf":
-            return process_pdf(file)
-        elif ext == "csv":
-            return process_csv(file)
-        elif ext in ("xls", "xlsx"):
-            return process_excel(file)
-        else:
-            st.warning(f"Unsupported file format: {file.name}")
-            return []
-    except Exception as e:
-        logger.error(f"Error processing {file.name}: {str(e)}")
-        st.error(f"Error processing {file.name}: {str(e)}")
-        return []
-
-def process_files_parallel(files):
-    with ThreadPoolExecutor() as executor:
-        results = list(executor.map(process_file, files))
-    return [c for sub in results for c in sub]
-
 @lru_cache(maxsize=32)
 def extract_contacts(text):
     records = []
@@ -94,17 +106,31 @@ def extract_contacts(text):
         phone = normalize_number(match.group())
         if not phone:
             continue
-        after = text[match.end():].strip()
-        name_match = re.search(NAME_REGEX, after)
-        name = name_match.group(0).strip() if name_match else ""
-        records.append((phone, name))
+        
+        context = text[max(0, match.start()-100):match.end()+100]
+        name_match = re.search(NAME_REGEX, context)
+        
+        if name_match:
+            name = ' '.join([part for part in name_match.group(0).split() if len(part) > 1])
+            records.append((phone, name))
+        else:
+            records.append((phone, ""))
     return records
 
 def process_pdf(file):
     try:
         with pdfplumber.open(file) as pdf:
             pages = pdf.pages[::2] if len(pdf.pages) > 20 else pdf.pages
-            return [c for page in pages if (txt := page.extract_text()) for c in extract_contacts(txt)]
+            contacts = []
+            seen_numbers = set()
+            
+            for page in pages:
+                if txt := page.extract_text():
+                    for phone, name in extract_contacts(txt):
+                        if phone and phone not in seen_numbers:
+                            contacts.append((phone, name))
+                            seen_numbers.add(phone)
+            return contacts
     except Exception as e:
         logger.error(f"PDF processing error: {str(e)}")
         return []
@@ -139,7 +165,29 @@ def extract_from_dataframe(df):
             records.extend(extract_contacts(line))
     return records
 
-# --- Firebase Save ---
+def process_file(file):
+    try:
+        ext = file.name.lower().split('.')[-1]
+        if ext == "pdf":
+            return process_pdf(file)
+        elif ext == "csv":
+            return process_csv(file)
+        elif ext in ("xls", "xlsx"):
+            return process_excel(file)
+        else:
+            st.warning(f"Unsupported file format: {file.name}")
+            return []
+    except Exception as e:
+        logger.error(f"Error processing {file.name}: {str(e)}")
+        st.error(f"Error processing {file.name}: {str(e)}")
+        return []
+
+def process_files_parallel(files):
+    with ThreadPoolExecutor() as executor:
+        results = list(executor.map(process_file, files))
+    return [c for sub in results for c in sub]
+
+# --- Firebase Operations ---
 def save_to_firestore(data):
     if not db or not data:
         return 0
@@ -147,7 +195,12 @@ def save_to_firestore(data):
     batch = db.batch()
     new_count = 0
     unique = {(p, n) for p, n in data if p}
+    
     for phone, name in unique:
+        if not validate_contact(phone, name):
+            logger.warning(f"Invalid contact skipped: {phone} - {name}")
+            continue
+            
         doc_ref = collection.document(phone.replace("+", ""))
         if not doc_ref.get().exists:
             first, last = "", ""
@@ -171,7 +224,16 @@ def save_to_firestore(data):
         batch.commit()
     return new_count
 
-# --- Load Message Logs ---
+def log_message(phone, name):
+    try:
+        db.collection("messages_sent").add({
+            "phone_number": phone,
+            "client_name": name,
+            "timestamp": firestore.SERVER_TIMESTAMP
+        })
+    except Exception as e:
+        logger.error(f"Log error for {phone}: {str(e)}")
+
 @st.cache_data
 def load_message_logs():
     try:
@@ -189,30 +251,56 @@ def load_message_logs():
         st.error("Could not load message logs.")
         return pd.DataFrame(columns=["Phone", "Date Messaged"])
 
-# --- Log Sent Message ---
-def log_message(phone, name):
-    try:
-        db.collection("messages_sent").add({
-            "phone_number": phone,
-            "client_name": name,
-            "timestamp": firestore.SERVER_TIMESTAMP
+# --- Export Functions ---
+def generate_standard_excel(data):
+    """Generate Excel with standardized format"""
+    formatted_data = []
+    for phone, name in data:
+        first, last = "", ""
+        if name:
+            parts = name.strip().split()
+            first = parts[0] if len(parts) > 0 else ""
+            last = " ".join(parts[1:]) if len(parts) > 1 else ""
+        
+        clean_phone = phone.replace("+", "") if phone else ""
+        
+        formatted_data.append({
+            "Firstname(optional)": first,
+            "Lastname(optional)": last,
+            "Phone or Email": clean_phone,
+            "phone(254)": clean_phone
         })
-    except Exception as e:
-        logger.error(f"Log error for {phone}: {str(e)}")
-
-# --- Export Helper ---
-def generate_excel(data):
-    df = pd.DataFrame(data, columns=["Phone Number", "Client Name"])
+    
+    df = pd.DataFrame(formatted_data)
     buffer = BytesIO()
     df.to_excel(buffer, index=False)
     buffer.seek(0)
     return buffer, df
 
+def download_full_contact_list():
+    """Download entire contact list from Firestore"""
+    try:
+        contacts_ref = db.collection("contacts")
+        docs = contacts_ref.stream()
+        
+        contact_list = []
+        for doc in docs:
+            data = doc.to_dict()
+            contact_list.append((
+                data.get("phone_number", ""),
+                data.get("client_name", "")
+            ))
+        
+        return generate_standard_excel(contact_list)
+    except Exception as e:
+        logger.error(f"Error downloading full contact list: {str(e)}")
+        return None, None
+
 # --- UI ---
 st.set_page_config(layout="wide", page_title="Sequid Hardware Contact System")
 tabs = st.tabs(["Upload & Sync", "Daily SMS List", "Dashboard"])
 
-# --- Tab 1: Upload ---
+# --- Tab 1: Upload & Sync ---
 with tabs[0]:
     st.subheader("Upload MPESA or Bank Statements")
     uploaded_files = st.file_uploader(
@@ -234,36 +322,80 @@ with tabs[0]:
                 st.success(f"Found {unique_count} unique contacts")
                 new_count = save_to_firestore(all_data)
                 st.success(f"Added {new_count} new contacts")
-                excel_file, df = generate_excel(all_data)
-                st.download_button("Download Excel", data=excel_file, file_name="contacts.xlsx")
+                excel_file, df = generate_standard_excel(all_data)
+                st.download_button(
+                    "Download Processed Contacts", 
+                    data=excel_file, 
+                    file_name="processed_contacts.xlsx",
+                    mime="application/vnd.ms-excel"
+                )
                 st.dataframe(df.head())
             else:
                 st.warning("No valid phone numbers found.")
+    
+    st.subheader("Contact Management")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("Download Full Contact List"):
+            with st.spinner("Preparing full contact list..."):
+                excel_file, df = download_full_contact_list()
+                if excel_file:
+                    st.download_button(
+                        label="Download Complete Contacts",
+                        data=excel_file,
+                        file_name="full_contact_list.xlsx",
+                        mime="application/vnd.ms-excel"
+                    )
+                    st.dataframe(df.head())
+                else:
+                    st.error("Failed to generate contact list")
+    
+    with col2:
+        if st.button("Refresh Contact Count"):
+            count = db.collection("contacts").count().get()[0][0].value
+            st.metric("Total Contacts in Database", count)
 
 # --- Tab 2: Daily SMS List ---
 with tabs[1]:
-    st.subheader("Generate Daily SMS List (only message once per 7 days)")
-    if st.button("Generate Today's List"):
-        all_contacts = db.collection("contacts").stream()
-        sent = load_message_logs()
-        recent_phones = sent[sent["Date Messaged"] >= (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")]["Phone"].tolist()
-
-        sms_data = []
-        for doc in all_contacts:
-            d = doc.to_dict()
-            phone = d.get("phone_number", "")
-            name = d.get("client_name", "")
-            if phone and phone not in recent_phones:
-                sms_data.append((phone, name))
-                log_message(phone, name)  # log that message is sent
-
-        if sms_data:
-            sms_excel, sms_df = generate_excel(sms_data)
-            st.success(f"{len(sms_data)} new contacts ready for messaging.")
-            st.download_button("Download SMS List", data=sms_excel, file_name="todays_sms_list.xlsx")
-            st.dataframe(sms_df)
+    st.subheader("Generate Daily SMS List (only message active customers once per 7 days)")
+    uploaded_file = st.file_uploader("Upload today's statement", type=["pdf", "csv", "xls", "xlsx"])
+    
+    if uploaded_file and st.button("Generate Today's List"):
+        current_data = process_file(uploaded_file)
+        current_numbers = {p for p, _ in current_data if p}
+        
+        if not current_data:
+            st.warning("No valid contacts found in this statement")
         else:
-            st.info("No new contacts to message today.")
+            sms_data = []
+            batch_size = 300
+            current_batches = [list(current_numbers)[i:i+batch_size] for i in range(0, len(current_numbers), batch_size)]
+            
+            for batch in current_batches:
+                docs = db.collection("messages_sent").where("phone_number", "in", batch).stream()
+                recent_messages = {doc.get("phone_number"): doc.get("timestamp") for doc in docs}
+                
+                for phone, name in current_data:
+                    if not phone:
+                        continue
+                    last_message = recent_messages.get(phone)
+                    if not last_message or (datetime.now() - last_message).days > 7:
+                        sms_data.append((phone, name))
+                        log_message(phone, name)
+            
+            if sms_data:
+                sms_excel, sms_df = generate_standard_excel(sms_data)
+                st.success(f"{len(sms_data)} active contacts ready for messaging.")
+                st.download_button(
+                    "Download SMS List", 
+                    data=sms_excel, 
+                    file_name=f"sms_list_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.ms-excel"
+                )
+                st.dataframe(sms_df)
+            else:
+                st.info("No eligible contacts to message today from this statement.")
 
 # --- Tab 3: Dashboard ---
 with tabs[2]:
@@ -283,4 +415,9 @@ with tabs[2]:
         st.markdown("### Message Log")
         st.dataframe(df_logs.sort_values("Date Messaged", ascending=False))
         csv = df_logs.to_csv(index=False).encode("utf-8")
-        st.download_button("Download Full Log CSV", data=csv, file_name="message_log.csv")
+        st.download_button(
+            "Download Full Log CSV", 
+            data=csv, 
+            file_name="message_log.csv",
+            mime="text/csv"
+        )
