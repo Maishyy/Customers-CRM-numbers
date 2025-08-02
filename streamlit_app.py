@@ -78,23 +78,30 @@ def format_phone_number(phone):
     return f"+{phone}"
 
 def clean_name(name):
-    """Clean and standardize name formatting"""
+    """Advanced name cleaning with duplicate prevention"""
     if not name or not isinstance(name, str):
         return ""
     
-    # Remove unwanted suffixes/company indicators
-    name = re.sub(r'\s*(TG[UV]|LTD|LIMITED|INTERNATIONAL|COMPANY)\s*$', '', name, flags=re.IGNORECASE)
+    # Remove unwanted suffixes and business indicators
+    suffixes = ["TGU", "TGV", "LTD", "LIMITED", "INTERNATIONAL", 
+               "COMPANY", "HOLDINGS", "ENTERPRISES", "TRADERS"]
+    pattern = r'\b(?:' + '|'.join(suffixes) + r')\b|\W+'
+    name = re.sub(pattern, ' ', name, flags=re.IGNORECASE)
     
-    # Remove special characters except spaces and hyphens
-    name = re.sub(r'[^\w\s-]', '', name)
+    # Standardize spacing and capitalization
+    name = ' '.join([word.capitalize() for word in name.split() if word])
     
-    # Standardize capitalization (Title Case)
-    name = ' '.join([part.capitalize() for part in name.split()])
+    # Remove duplicate words in names
+    words = name.split()
+    unique_words = []
+    seen_words = set()
+    for word in words:
+        lower_word = word.lower()
+        if lower_word not in seen_words:
+            seen_words.add(lower_word)
+            unique_words.append(word)
     
-    # Remove extra spaces
-    name = ' '.join(name.split())
-    
-    return name.strip()
+    return ' '.join(unique_words).strip()
 
 def should_exclude_line(line):
     """Check if line should be excluded from processing"""
@@ -123,6 +130,29 @@ def validate_contact(phone, name):
         if len(name_parts) < 1 or any(len(part) < 2 for part in name_parts):
             return False
             
+    return True
+
+def validate_contact_strict(phone, name):
+    """Strict validation with duplicate pattern detection"""
+    if not validate_contact(phone, name):
+        return False
+    
+    # Check for suspicious duplicate patterns
+    name_parts = name.split()
+    if len(name_parts) > 1:
+        # Check for repeated first/last names
+        if name_parts[0] == name_parts[-1]:
+            return False
+            
+        # Check for very short names
+        if any(len(part) < 2 for part in name_parts):
+            return False
+    
+    # Check phone number patterns
+    digits = re.sub(r'[^\d]', '', phone)
+    if len(set(digits)) < 4:  # Too many repeating digits
+        return False
+    
     return True
 
 # --- File Processors with Enhanced Quality Control ---
@@ -247,6 +277,35 @@ def process_files_parallel(files):
         results = list(executor.map(process_file, files))
     return [contact for sublist in results for contact in sublist]
 
+def process_file_with_duplicate_checks(file):
+    """Process file with enhanced duplicate detection"""
+    try:
+        contacts = process_file(file)  # Your existing processing
+        
+        # First-level deduplication
+        unique_contacts = {}
+        for phone, name in contacts:
+            if not phone:
+                continue
+                
+            # Normalize phone and name
+            norm_phone = phone.replace("+", "").strip()
+            norm_name = clean_name(name)
+            
+            # Check if we've seen this exact phone-name combo
+            if norm_phone in unique_contacts:
+                existing_name = unique_contacts[norm_phone][1]
+                # Keep the more complete name if we have two versions
+                if len(norm_name) > len(existing_name):
+                    unique_contacts[norm_phone] = (phone, norm_name)
+            else:
+                unique_contacts[norm_phone] = (phone, norm_name)
+        
+        return list(unique_contacts.values())
+    except Exception as e:
+        logger.error(f"Error in duplicate check: {str(e)}")
+        return []
+
 # --- Firebase Operations with Enhanced Validation ---
 def save_to_firestore(data):
     """Save contacts to Firestore with duplicate prevention"""
@@ -266,7 +325,7 @@ def save_to_firestore(data):
     
     # Process contacts
     for phone, name in {(p, n) for p, n in data if p}:
-        if not validate_contact(phone, name):
+        if not validate_contact_strict(phone, name):
             continue
             
         doc_ref = collection.document(phone.replace("+", ""))
@@ -341,6 +400,29 @@ def load_message_logs(days=30):
         logger.error(f"Error loading logs: {str(e)}")
         st.error("Could not load message logs.")
         return pd.DataFrame(columns=["Phone", "Date Messaged", "Status"])
+
+def get_last_message_dates(phone_numbers):
+    """Safe method to get last message dates for a batch of numbers"""
+    last_messages = {}
+    batch_size = 30  # Reduced batch size for stability
+    phone_batches = [phone_numbers[i:i + batch_size] for i in range(0, len(phone_numbers), batch_size)]
+    
+    for batch in phone_batches:
+        try:
+            docs = db.collection("messages_sent")\
+                    .where("phone_number", "in", batch)\
+                    .order_by("timestamp", direction=firestore.Query.DESCENDING)\
+                    .limit(1)\
+                    .stream()
+            
+            for doc in docs:
+                data = doc.to_dict()
+                last_messages[data["phone_number"]] = data["timestamp"]
+        except Exception as e:
+            logger.error(f"Error fetching messages for batch: {str(e)}")
+            continue
+    
+    return last_messages
 
 # --- Enhanced Export Functions ---
 def generate_standard_excel(data):
@@ -502,36 +584,20 @@ with tabs[1]:
     )
     
     if uploaded_file and st.button("Generate Today's List"):
-        current_data = process_file(uploaded_file)
-        current_numbers = {p for p, _ in current_data if p}
-        
-        if not current_data:
-            st.warning("No valid contacts found in this statement")
-        else:
-            # Get message history for these specific numbers
-            sms_data = []
-            batch_size = 300  # Firestore query limit
-            current_batches = [
-                list(current_numbers)[i:i+batch_size] 
-                for i in range(0, len(current_numbers), batch_size)
-            ]
+        with st.spinner("Processing statement..."):
+            current_data = process_file_with_duplicate_checks(uploaded_file)
+            current_numbers = {p for p, _ in current_data if p}
             
-            progress_bar = st.progress(0)
-            total_batches = len(current_batches)
-            
-            for i, batch in enumerate(current_batches):
-                # Get last message date for these numbers
-                docs = db.collection("messages_sent")\
-                        .where("phone_number", "in", batch)\
-                        .order_by("timestamp", direction=firestore.Query.DESCENDING)\
-                        .limit(1)\
-                        .stream()
+            if not current_data:
+                st.warning("No valid contacts found in this statement")
+            else:
+                # Get message history in safe batches
+                last_messages = get_last_message_dates(list(current_numbers))
                 
-                last_messages = {doc.get("phone_number"): doc.get("timestamp") for doc in docs}
-                
-                # Check eligibility
+                # Filter eligible contacts
+                sms_data = []
                 for phone, name in current_data:
-                    if not phone or phone not in batch:
+                    if not phone:
                         continue
                         
                     last_message = last_messages.get(phone)
@@ -542,23 +608,28 @@ with tabs[1]:
                     
                     if eligible:
                         sms_data.append((phone, name))
+                
+                # Further deduplication
+                final_sms_data = []
+                seen_phones = set()
+                for phone, name in sms_data:
+                    if phone not in seen_phones:
+                        final_sms_data.append((phone, name))
+                        seen_phones.add(phone)
                         log_message(phone, name)
                 
-                # Update progress
-                progress_bar.progress((i + 1) / total_batches)
-            
-            if sms_data:
-                sms_excel, sms_df = generate_standard_excel(sms_data)
-                st.success(f"{len(sms_data)} active contacts ready for messaging.")
-                st.download_button(
-                    "Download SMS List", 
-                    data=sms_excel, 
-                    file_name=f"sms_list_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                    mime="application/vnd.ms-excel"
-                )
-                st.dataframe(sms_df)
-            else:
-                st.info("No eligible contacts to message today from this statement.")
+                if final_sms_data:
+                    sms_excel, sms_df = generate_standard_excel(final_sms_data)
+                    st.success(f"{len(final_sms_data)} active contacts ready for messaging.")
+                    st.download_button(
+                        "Download SMS List", 
+                        data=sms_excel, 
+                        file_name=f"sms_list_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.ms-excel"
+                    )
+                    st.dataframe(sms_df)
+                else:
+                    st.info("No eligible contacts to message today from this statement.")
 
 # --- Tab 3: Dashboard ---
 with tabs[2]:
