@@ -1,41 +1,52 @@
+# streamlit_app.py
+# — Updated with robust phone/name extraction and bank-specific parser (Co-op & Equity)
+# — Fixes: openpyxl styling (no XlsxWriter calls), safer file-size, Firestore count fallback,
+#          batch-safe queries, better duplicate handling, and resilient PDF/CSV/Excel parsing.
+
+import os
 import re
+import json
+import logging
+from io import BytesIO
+from textwrap import dedent
+from datetime import datetime, timedelta
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+
 import pandas as pd
 import streamlit as st
 import pdfplumber
-from io import BytesIO
-from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
-import json
+
 import firebase_admin
 from firebase_admin import credentials, firestore
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
-import logging
-import os
-from collections import defaultdict
 
 # -----------------------------
-# Streamlit page config first
+# Streamlit page config
 # -----------------------------
 st.set_page_config(layout="wide", page_title="Sequid Hardware Contact System")
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(), logging.FileHandler('app.log')]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("app.log")]
 )
 logger = logging.getLogger(__name__)
 
-# --- Firebase Setup ---
-TEST_MODE = st.sidebar.checkbox("Enable Test Mode", help="Use local Firebase emulator")
+# -----------------------------
+# Firebase Setup
+# -----------------------------
+TEST_MODE = st.sidebar.checkbox(
+    "Enable Test Mode",
+    help="Use local Firebase emulator (set FIRESTORE_EMULATOR_HOST)."
+)
 
 db = None
 if TEST_MODE:
     os.environ["FIRESTORE_EMULATOR_HOST"] = "localhost:8080"
     try:
         if not firebase_admin._apps:
-            # In emulator mode, credentials can be omitted; keep local override if user provided it.
             if os.path.exists("local_test_creds.json"):
                 firebase_admin.initialize_app(credentials.Certificate("local_test_creds.json"))
             else:
@@ -55,30 +66,55 @@ else:
         db = firestore.client()
     except Exception as e:
         logger.error(f"Firebase initialization failed: {str(e)}")
-        st.error("Failed to initialize Firebase. Check logs for details.")
+        st.error("Failed to initialize Firebase (check st.secrets['firebase_creds']).")
         st.stop()
 
-# --- Constants ---
-# Match diverse phone formats; we will normalize/validate later.
-# Accepts +254 7xx xxx xxx, 07xx xxx xxx, 7xx xxx xxx, 01xx xxx xxx, 11xx (as 011x after normalization)
+# -----------------------------
+# Constants & Regex
+# -----------------------------
+
+# Flexible phone matcher (accepts +254 7xx xxx xxx, 07xxxxxxxx, 7xxxxxxxx, 011xxxxxxxx; spaces/dashes allowed)
 PHONE_FLEX = re.compile(
-    r'(?:\\+?254|0)?\\s*(?:7\\d{2}|1[01]\\d)\\s*[\\s-]?\\d{3}[\\s-]?\\d{3}'
+    r'(?:\+?254|0)?\s*(?:7\d{2}|1[0-9]\d)\s*[\s-]?\d{3}[\s-]?\d{3}'
 )
 
-# Name patterns: allow 1-3 tokens, letters & apostrophes/hyphens, mixed case.
-NAME_TOKEN = r"[A-Za-z][A-Za-z\\'\\-]{1,}"
-NAME_PATTERN = re.compile(rf'({NAME_TOKEN}(?:\\s+{NAME_TOKEN}){{0,2}})')
+# Bank-specific relaxed matcher (same idea, kept separate for clarity)
+BANK_PHONE_REGEX = re.compile(
+    r'(?:\+?254|0)?\s*(?:7\d{2}|1[0-9]\d)\s*\d{3}\s*\d{3}'
+)
+
+# Name patterns: allow 1–3 tokens, letters plus apostrophes/hyphens, mixed case
+NAME_TOKEN = r"[A-Za-z][A-Za-z\'\-]{1,}"
+NAME_PATTERN = re.compile(rf'({NAME_TOKEN}(?:\s+{NAME_TOKEN}){{0,2}})')
+
+# Noise & codes to strip
+NOISE_TOKEN = re.compile(r'\b(?:MPESA|M-PESA|PAYBILL|TILL|ACC(?:OUNT)?|REF(?:ERENCE)?|BALANCE|CONFIRMATION|RECEIPT|SALES)\b', re.I)
+TXN_CODE = re.compile(r'\b[A-Z0-9]{8,12}\b')  # generic MPESA/Bank-like refs (e.g., TGU53XDSZD)
+
+# Typical MPESA refs start with letters (T...), include alphanumerics; we’ll search last code and take name after it
+MPESA_CODE_CHUNK = re.compile(r'\bT[A-Z0-9]{8,}\b', re.I)
 
 EXCLUDE_WORDS_HARD = {"CDM", "CHEQUE"}
 EXCLUDE_WORDS_SOFT = {"BANK", "TRANSFER", "LTD", "LIMITED", "INTERNATIONAL"}
+
 BLACKLISTED_NUMBERS = {"+254722000000", "+254000000000"}
 MAX_FILE_SIZE_MB = 10
-VALID_KENYAN_PREFIXES = {'70','71','72','73','74','75','76','77','78','79','11'}
 
-# Common MPESA/bank noise tokens to strip when near names
-NOISE_TOKEN = re.compile(r'\\b(?:MPESA|M-PESA|PAYBILL|TILL|ACC(?:OUNT)?|REF(?:ERENCE)?|BALANCE|CONFIRMATION|RECEIPT|SALES)\\b', re.I)
-TXN_CODE = re.compile(r'\\b[A-Z0-9]{8,12}\\b')  # MPESA/Bank reference-like strings
+# Kenyan mobile prefixes: 07x and 01x (0110–0119, etc.). We’ll validate more generically.
+def _valid_ke_prefix(digits12: str) -> bool:
+    # digits12: '2547xxxxxxxx' or '2541xxxxxxxx'
+    if len(digits12) != 12 or not digits12.startswith('254'):
+        return False
+    after = digits12[3:]  # e.g., '7xxxxxxxxx' or '1xxxxxxxxx'
+    if after[0] == '7' and after[1].isdigit():
+        return True
+    if after[0] == '1' and after[1].isdigit():
+        return True
+    return False
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def safe_file_size(uploaded_file) -> int:
     """Return file size in bytes in a Streamlit-version-safe way."""
     try:
@@ -87,34 +123,37 @@ def safe_file_size(uploaded_file) -> int:
         try:
             return len(uploaded_file.getbuffer())
         except Exception:
-            uploaded_file.seek(0, 2)
-            size = uploaded_file.tell()
-            uploaded_file.seek(0)
-            return size
+            try:
+                pos = uploaded_file.tell()
+            except Exception:
+                pass
+            try:
+                uploaded_file.seek(0, 2)
+                size = uploaded_file.tell()
+                uploaded_file.seek(0)
+                return size
+            except Exception:
+                return 0
 
-# --- Helper Functions ---
 def format_phone_number(raw: str):
     """Standardize phone to +254 format with rigorous validation."""
     if not raw:
         return None
+    digits = re.sub(r'\D', '', str(raw))
 
-    digits = re.sub(r'\\D', '', str(raw))
-    # Normalize to 2547/25411 form first
+    # Normalize to 254xxxxxxxxx (12 digits with country code)
     if digits.startswith('0') and len(digits) == 10:
-        # 07xxxxxxxx or 01xxxxxxxx -> 2547xxxxxxx / 2541xxxxxxx
         digits = '254' + digits[1:]
     elif digits.startswith('7') and len(digits) == 9:
         digits = '254' + digits
-    elif digits.startswith('1') and len(digits) == 9:  # 1xx for 011x lines
+    elif digits.startswith('1') and len(digits) == 9:
         digits = '254' + digits
     elif digits.startswith('254') and len(digits) == 12:
         pass
     else:
         return None
 
-    # Validate Kenyan mobile prefix
-    prefix = digits[3:5]  # e.g., 2547|25411 -> '7x' or '11'
-    if len(digits) != 12 or prefix not in VALID_KENYAN_PREFIXES:
+    if not _valid_ke_prefix(digits):
         return None
 
     phone = '+' + digits
@@ -123,36 +162,32 @@ def format_phone_number(raw: str):
     return phone
 
 def clean_name(name: str) -> str:
-    """Clean and normalize someone-like names."""
+    """Clean and normalize human-like names."""
     if not name or not isinstance(name, str):
         return ""
 
-    # Remove obvious noise
+    # Remove obvious noise and refs
     name = NOISE_TOKEN.sub(' ', name)
     name = TXN_CODE.sub(' ', name)
     # Remove non-letters except space, apostrophe, hyphen
-    name = re.sub(r"[^A-Za-z'\\-\\s]", ' ', name)
+    name = re.sub(r"[^A-Za-z'\-\s]", ' ', name)
     # Collapse spaces
-    name = re.sub(r'\\s+', ' ', name).strip()
+    name = re.sub(r'\s+', ' ', name).strip()
 
-    # Capitalize tokens
-    parts = [p for p in name.split(' ') if p]
-    parts = [p.capitalize() for p in parts]
-
-    # Remove duplicate tokens keeping order
+    tokens = [t.capitalize() for t in name.split() if t]
+    # de-duplicate tokens preserving order
     seen = set()
     uniq = []
-    for p in parts:
-        pl = p.lower()
-        if pl not in seen:
-            seen.add(pl)
-            uniq.append(p)
+    for t in tokens:
+        tl = t.lower()
+        if tl not in seen:
+            seen.add(tl)
+            uniq.append(t)
 
-    # Keep max 3 tokens
+    # Keep up to 3 tokens
     uniq = uniq[:3]
     cleaned = ' '.join(uniq).strip()
 
-    # Filter out too short / clearly invalid
     if not cleaned:
         return ""
     if any(len(tok) < 2 for tok in cleaned.split()):
@@ -160,60 +195,69 @@ def clean_name(name: str) -> str:
     return cleaned
 
 def should_exclude_line(line: str, has_phone: bool) -> bool:
-    """Exclude headers or noise lines. Be softer if a phone exists in the line."""
+    """Exclude headers or noise lines. Be softer if the line has a phone."""
     if not isinstance(line, str):
         return True
     U = line.upper()
-    # Hard excludes (regardless)
     if any(w in U for w in EXCLUDE_WORDS_HARD):
         return True
-    # Soft excludes only if no phone in the line
     if not has_phone and any(w in U for w in EXCLUDE_WORDS_SOFT):
         return True
     return False
 
 def try_extract_name_near(text_line: str, start_idx: int, end_idx: int) -> str:
     """Grab a plausible name near the phone in the same line (left or right window)."""
-    window_left = text_line[max(0, start_idx-50):start_idx]
-    window_right = text_line[end_idx:end_idx+50]
+    window_left = text_line[max(0, start_idx - 50):start_idx]
+    window_right = text_line[end_idx:end_idx + 50]
 
-    # Prefer left side tokens like "... JOHN DOE 07xx ..."
     m_left = NAME_PATTERN.findall(window_left)
     cand = m_left[-1] if m_left else ''
     if not cand:
         m_right = NAME_PATTERN.findall(window_right)
         cand = m_right[0] if m_right else ''
+    return clean_name(cand)
 
-    cand = clean_name(cand)
-    return cand
+def validate_contact(phone, name):
+    if not phone or len(phone) != 13 or not phone.startswith("+254"):
+        return False
+    digits = phone[1:]
+    if not _valid_ke_prefix(digits):
+        return False
+    if name:
+        parts = name.split()
+        if any(len(p) < 2 for p in parts):
+            return False
+    return True
 
+def validate_contact_strict(phone, name):
+    if not validate_contact(phone, name):
+        return False
+    digits = re.sub(r'\D', '', phone)
+    if len(set(digits)) < 4:  # prevent things like +254777777777
+        return False
+    return True
+
+# -----------------------------
+# Extraction (generic)
+# -----------------------------
 @lru_cache(maxsize=64)
 def extract_contacts(text: str):
     """Extract contacts line-by-line with improved heuristics and validation."""
     results = []
     seen = set()
-
-    # Split into lines to reduce cross-talk
-    lines = re.split(r'\\r?\\n+', text)
-    prev_name_hint = ""
+    lines = re.split(r'\r?\n+', text)
 
     for idx, line in enumerate(lines):
-        if not line or not isinstance(line, str):
+        if not isinstance(line, str) or not line.strip():
             continue
 
-        # Find phones in line
         phones = list(PHONE_FLEX.finditer(line))
         has_phone = bool(phones)
         if should_exclude_line(line, has_phone):
-            # Keep a weak name hint if line looks like a name-only line
-            if not has_phone:
-                nm = NAME_PATTERN.search(line)
-                prev_name_hint = clean_name(nm.group(0)) if nm else prev_name_hint
             continue
 
-        # If many numbers in line (likely ref codes), skip
-        digit_groups = re.findall(r'\\d+', line)
-        if len(digit_groups) > 4 and not has_phone:
+        # Skip rows with many random numbers (likely refs)
+        if len(re.findall(r'\d+', line)) > 6 and not has_phone:
             continue
 
         for m in phones:
@@ -222,18 +266,15 @@ def extract_contacts(text: str):
             if not phone or phone in seen:
                 continue
 
-            # same-line name first
             name = try_extract_name_near(line, m.start(), m.end())
 
-            # fallback: previous line hint if no name yet
+            # Fallback to previous line
             if not name and idx > 0:
-                nm_prev = NAME_PATTERN.search(lines[idx-1]) if idx > 0 else None
+                nm_prev = NAME_PATTERN.search(lines[idx - 1]) if idx > 0 else None
                 if nm_prev:
                     name = clean_name(nm_prev.group(0))
 
-            # last fallback: keep empty name (will still pass if phone valid)
             if name and not validate_contact(phone, name):
-                # name may be too short—keep phone-only
                 name = ""
 
             if validate_contact(phone, name or ""):
@@ -242,37 +283,145 @@ def extract_contacts(text: str):
 
     return results
 
-def validate_contact(phone, name):
-    """Comprehensive contact validation"""
-    if not phone or len(phone) != 13 or not phone.startswith("+254"):
-        return False
+# -----------------------------
+# Bank-specific extraction (Co-op & Equity)
+# -----------------------------
+def _guess_narrative_columns(df: pd.DataFrame):
+    # Prefer explicit "Narrative" (case-insensitive)
+    narrative_cols = [c for c in df.columns if isinstance(c, str) and 'narrative' in c.lower()]
+    if narrative_cols:
+        return narrative_cols
 
-    # Additional phone validation
-    prefix = phone[4:6]  # e.g., +2547..., +25411...
-    if prefix not in VALID_KENYAN_PREFIXES:
-        return False
+    # Heuristic: pick text-like columns with long strings and MPESA-like patterns
+    candidates = []
+    for c in df.columns:
+        try:
+            series = df[c].dropna().astype(str)
+        except Exception:
+            continue
+        if series.empty:
+            continue
+        # check typical patterns (MPS, Txxxx codes, 2547…)
+        sample = " ".join(series.head(10).tolist())
+        hits = 0
+        if re.search(r'\bMPS\b|\bM-PESA\b|\bMPESA\b', sample, re.I):
+            hits += 1
+        if re.search(r'\bT[A-Z0-9]{8,}\b', sample, re.I):
+            hits += 1
+        if re.search(r'\b2547\d{7}\b', sample):
+            hits += 1
+        if hits >= 1:
+            candidates.append(c)
 
-    # Name validation (optional)
-    if name:
-        parts = name.split()
-        if any(len(p) < 2 for p in parts):
-            return False
-    return True
+    # If still nothing, pick the longest average-length text column
+    if not candidates:
+        best_col = None
+        best_len = 0
+        for c in df.columns:
+            try:
+                series = df[c].dropna().astype(str)
+            except Exception:
+                continue
+            if series.empty:
+                continue
+            avg_len = series.map(len).mean()
+            if avg_len > best_len:
+                best_len = avg_len
+                best_col = c
+        if best_col:
+            return [best_col]
+        return []
 
-def validate_contact_strict(phone, name):
-    """Strict validation with duplicate/entropy checks"""
-    if not validate_contact(phone, name):
-        return False
+    return candidates
 
-    # Check for suspicious duplicate patterns
-    digits = re.sub(r'\\D', '', phone)
-    if len(set(digits)) < 4:  # Too many repeating digits
-        return False
-    return True
+def extract_from_bank_statement(df: pd.DataFrame):
+    """Special parser for bank statement Excel with a Narrative-like column."""
+    results = []
+    seen = set()
 
-# --- File Processors ---
+    narrative_cols = _guess_narrative_columns(df)
+    if not narrative_cols:
+        return results
+
+    for _, row in df.iterrows():
+        for col in narrative_cols:
+            val = str(row.get(col, "")) if pd.notna(row.get(col, "")) else ""
+            if not val.strip():
+                continue
+
+            # Find all phones in the narrative (often has two numbers: customer + agent/till)
+            phones = BANK_PHONE_REGEX.findall(val)
+            phones = [format_phone_number(p) for p in phones]
+            phones = [p for p in phones if p]
+
+            if not phones:
+                continue
+
+            # Use the first phone as customer phone
+            phone = phones[0]
+            if phone in seen:
+                continue
+
+            # Extract a name after the last MPESA-like code if present
+            name_part = val
+            mpesa_codes = MPESA_CODE_CHUNK.findall(val)
+            if mpesa_codes:
+                last_code = mpesa_codes[-1]
+                idx = val.lower().rfind(last_code.lower())
+                if idx != -1:
+                    name_part = val[idx + len(last_code):]
+
+            name = clean_name(name_part)
+
+            # If no decent name found, try stripping leading tokens like "MPS 2547..."
+            if not name:
+                m = re.search(r'\b(?:MPS|MPESA|M-PESA)\b\s*(.*)$', val, re.I)
+                if m:
+                    name = clean_name(m.group(1))
+
+            if validate_contact(phone, name or ""):
+                results.append((phone, name))
+                seen.add(phone)
+
+    return results
+
+# -----------------------------
+# File processors
+# -----------------------------
+def extract_from_dataframe(df: pd.DataFrame):
+    records = []
+    for _, row in df.iterrows():
+        vals = [str(x) for x in row.values.tolist() if pd.notna(x)]
+        line = " ".join(vals)
+        has_phone = bool(PHONE_FLEX.search(line))
+        if not should_exclude_line(line, has_phone):
+            records.extend(extract_contacts(line))
+    return records
+
+def _read_excel_all_sheets(file):
+    """Read all sheets with correct engine based on extension, with graceful errors."""
+    name = (getattr(file, "name", "") or "").lower()
+    engine = None
+    if name.endswith(".xlsx"):
+        engine = "openpyxl"
+    elif name.endswith(".xls"):
+        # For .xls, pandas needs xlrd installed. Let pandas attempt default engine first,
+        # and if it errors about xlrd, we surface a helpful message.
+        engine = None
+
+    try:
+        return pd.read_excel(file, sheet_name=None, engine=engine)
+    except Exception as e:
+        msg = str(e)
+        if ".xls" in name and "xlrd" in msg.lower():
+            st.error(
+                "This .xls file requires the optional dependency **xlrd**. "
+                "Please install it in your environment, e.g.:\n\n"
+                "`pip install xlrd`"
+            )
+        raise
+
 def process_pdf(file):
-    """Process PDF with duplicate prevention and progress tracking"""
     try:
         with pdfplumber.open(file) as pdf:
             total_pages = len(pdf.pages)
@@ -280,6 +429,7 @@ def process_pdf(file):
             contacts = []
             seen_numbers = set()
 
+            # Basic sampling for very long PDFs
             pages = pdf.pages[::2] if total_pages > 20 else pdf.pages
 
             for i, page in enumerate(pages):
@@ -292,29 +442,14 @@ def process_pdf(file):
                         if phone and phone not in seen_numbers:
                             contacts.append((phone, name))
                             seen_numbers.add(phone)
-
                 progress_bar.progress((i + 1) / len(pages))
-
             return contacts
     except Exception as e:
         logger.error(f"PDF processing error: {str(e)}")
         st.error(f"Error processing PDF: {str(e)}")
         return []
 
-def extract_from_dataframe(df: pd.DataFrame):
-    """Extract contacts from dataframe rows"""
-    records = []
-    for _, row in df.iterrows():
-        vals = [str(x) for x in row.values.tolist() if pd.notna(x)]
-        line = " ".join(vals)
-        # Determine if this "line" has a phone for exclusion logic
-        has_phone = bool(PHONE_FLEX.search(line))
-        if not should_exclude_line(line, has_phone):
-            records.extend(extract_contacts(line))
-    return records
-
 def process_csv(file):
-    """Process CSV with chunking for large files"""
     try:
         size = safe_file_size(file)
         if size > 5 * 1024 * 1024:  # 5MB
@@ -329,22 +464,25 @@ def process_csv(file):
         return []
 
 def process_excel(file):
-    """Process Excel files with multiple sheets"""
     try:
-        name = file.name.lower()
-        engine = 'openpyxl' if name.endswith('xlsx') else None
-        dfs = pd.read_excel(file, sheet_name=None, engine=engine)
-        sheets = list(dfs.items())[:3] if len(dfs) > 3 else dfs.items()
-        return [contact for _, df in sheets for contact in extract_from_dataframe(df)]
+        dfs = _read_excel_all_sheets(file)
+        output = []
+        for sheet_name, df in dfs.items():
+            cols_lower = [str(c).lower() for c in df.columns]
+            # If sheet has/looks like "Narrative", apply bank-specific parsing
+            if any('narrative' in c for c in cols_lower) or _guess_narrative_columns(df):
+                output.extend(extract_from_bank_statement(df))
+            else:
+                output.extend(extract_from_dataframe(df))
+        return output
     except Exception as e:
         logger.error(f"Excel processing error: {str(e)}")
         st.error(f"Error processing Excel: {str(e)}")
         return []
 
 def process_file(file):
-    """Main file processor with error handling"""
     try:
-        ext = file.name.lower().split('.')[-1]
+        ext = (file.name or "").lower().split('.')[-1]
         if ext == "pdf":
             return process_pdf(file)
         elif ext == "csv":
@@ -360,68 +498,62 @@ def process_file(file):
         return []
 
 def process_files_parallel(files):
-    """Process multiple files in parallel"""
     with ThreadPoolExecutor() as executor:
         results = list(executor.map(process_file, files))
-    return [contact for sublist in results for contact in sublist]
+    return [c for sub in results for c in sub]
 
 def process_file_with_duplicate_checks(file):
-    """Process file with enhanced duplicate detection"""
     try:
         contacts = process_file(file)
-
-        # First-level deduplication
         unique_contacts = {}
         for phone, name in contacts:
             if not phone:
                 continue
-            norm_phone = phone.replace("+", "").strip()
-            norm_name = clean_name(name)
-
-            if norm_phone in unique_contacts:
-                existing_name = unique_contacts[norm_phone][1]
-                if len(norm_name) > len(existing_name):
-                    unique_contacts[norm_phone] = (phone, norm_name)
+            k = phone.replace("+", "").strip()
+            nm = clean_name(name)
+            if k in unique_contacts:
+                # prefer longer name
+                if len(nm) > len(unique_contacts[k][1]):
+                    unique_contacts[k] = (phone, nm)
             else:
-                unique_contacts[norm_phone] = (phone, norm_name)
-
+                unique_contacts[k] = (phone, nm)
         return list(unique_contacts.values())
     except Exception as e:
         logger.error(f"Error in duplicate check: {str(e)}")
         return []
 
-# --- Firebase Operations ---
+# -----------------------------
+# Firebase Operations
+# -----------------------------
 def save_to_firestore(data):
-    """Save contacts to Firestore with duplicate prevention"""
+    """Save contacts to Firestore with duplicate prevention."""
     if not db or not data:
         return 0, 0
 
-    collection = db.collection("contacts")
+    coll = db.collection("contacts")
     batch = db.batch()
     new_count = 0
     duplicate_count = 0
 
-    # Preload existing numbers (phones are stored as '+254...')
+    # Preload existing numbers
     existing_numbers = set()
     try:
-        docs = collection.select(["phone_number"]).stream()
-        for doc in docs:
+        for doc in coll.select(["phone_number"]).stream():
             existing_numbers.add(doc.get("phone_number"))
     except Exception as e:
         logger.warning(f"Prefetch existing numbers failed: {e}")
 
-    # Process contacts
     for phone, name in {(p, n) for p, n in data if p}:
         if not validate_contact_strict(phone, name):
             continue
-
-        doc_ref = collection.document(phone.replace("+", ""))
 
         if phone in existing_numbers:
             duplicate_count += 1
             continue
 
-        first = last = ""
+        doc_ref = coll.document(phone.replace("+", ""))
+
+        first, last = "", ""
         if name:
             parts = name.strip().split(" ", 1)
             first = parts[0]
@@ -439,7 +571,6 @@ def save_to_firestore(data):
         new_count += 1
         existing_numbers.add(phone)
 
-        # Commit in batches of 500
         if new_count % 500 == 0:
             batch.commit()
             batch = db.batch()
@@ -450,7 +581,6 @@ def save_to_firestore(data):
     return new_count, duplicate_count
 
 def log_message(phone, name):
-    """Log sent messages with enhanced error handling"""
     try:
         db.collection("messages_sent").add({
             "phone_number": phone,
@@ -463,25 +593,22 @@ def log_message(phone, name):
 
 @st.cache_data(ttl=3600)
 def load_message_logs(days=30):
-    """Load message logs with date filtering"""
     try:
         cutoff = datetime.now() - timedelta(days=days)
         docs = (db.collection("messages_sent")
-                  .where("timestamp", ">=", cutoff)
-                  .stream())
-
+                .where("timestamp", ">=", cutoff)
+                .stream())
         data = []
         for doc in docs:
             d = doc.to_dict()
             phone = d.get("phone_number", "")
-            date = d.get("timestamp")
-            # Firestore timestamps may be None or have .strftime
-            if hasattr(date, 'strftime'):
-                date_str = date.strftime("%Y-%m-%d")
+            ts = d.get("timestamp")
+            # normalize timestamp display
+            if hasattr(ts, 'strftime'):
+                date_str = ts.strftime("%Y-%m-%d")
             else:
                 try:
-                    # Firestore Timestamp to datetime
-                    date_str = date.to_datetime().strftime("%Y-%m-%d") if date else ""
+                    date_str = ts.to_datetime().strftime("%Y-%m-%d") if ts else ""
                 except Exception:
                     date_str = ""
             data.append({
@@ -496,53 +623,47 @@ def load_message_logs(days=30):
         return pd.DataFrame(columns=["Phone", "Date Messaged", "Status"])
 
 def get_last_message_dates(phone_numbers):
-    """Safe method to get last message dates for a batch of numbers"""
     last_messages = {}
     if not phone_numbers:
         return last_messages
 
-    batch_size = 30  # Firestore 'in' limit is 30
-    phone_batches = [phone_numbers[i:i + batch_size] for i in range(0, len(phone_numbers), batch_size)]
-
-    for batch in phone_batches:
+    batch_size = 30
+    batches = [phone_numbers[i:i + batch_size] for i in range(0, len(phone_numbers), batch_size)]
+    for batch in batches:
         if not batch:
             continue
         try:
-            # Query one-by-one for reliability with order_by+limit
             for p in batch:
                 docs = (db.collection("messages_sent")
-                          .where("phone_number", "==", p)
-                          .order_by("timestamp", direction=firestore.Query.DESCENDING)
-                          .limit(1)
-                          .stream())
+                        .where("phone_number", "==", p)
+                        .order_by("timestamp", direction=firestore.Query.DESCENDING)
+                        .limit(1)
+                        .stream())
                 for doc in docs:
                     data = doc.to_dict()
                     last_messages[data["phone_number"]] = data.get("timestamp")
         except Exception as e:
             logger.error(f"Error fetching messages for batch: {str(e)}")
             continue
-
     return last_messages
 
-# --- Export Functions ---
+# -----------------------------
+# Export / Download
+# -----------------------------
 def generate_standard_excel(data):
-    """Generate standardized Excel output with quality checks using openpyxl styles."""
+    """Generate standardized Excel output with openpyxl styling."""
     formatted_data = []
     seen = set()
-
     for phone, name in data:
         if phone in seen:
             continue
         seen.add(phone)
-
         first = last = ""
         if name:
             parts = name.strip().split()
             first = parts[0] if parts else ""
             last = " ".join(parts[1:]) if len(parts) > 1 else ""
-
         clean_phone = phone.replace("+", "") if phone else ""
-
         formatted_data.append({
             "Firstname(optional)": first,
             "Lastname(optional)": last,
@@ -555,7 +676,6 @@ def generate_standard_excel(data):
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Contacts')
-        # openpyxl styling
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         wb = writer.book
         ws = writer.sheets['Contacts']
@@ -566,7 +686,7 @@ def generate_standard_excel(data):
         thin = Side(style='thin')
         thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-        # Apply to header row
+        # Header styling
         for col_idx, col_name in enumerate(df.columns, start=1):
             cell = ws.cell(row=1, column=col_idx)
             cell.value = col_name
@@ -575,7 +695,7 @@ def generate_standard_excel(data):
             cell.alignment = header_alignment
             cell.border = thin_border
 
-        # Autosize columns (basic)
+        # Autosize columns
         for col_idx, col_name in enumerate(df.columns, start=1):
             max_len = max([len(str(col_name))] + [len(str(v)) for v in df[col_name].astype(str).tolist()])
             ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 40)
@@ -584,25 +704,21 @@ def generate_standard_excel(data):
     return buffer, df
 
 def download_full_contact_list():
-    """Download entire contact list with quality indicators"""
     try:
         contacts_ref = db.collection("contacts")
         docs = contacts_ref.stream()
-
         contact_list = []
         for doc in docs:
             data = doc.to_dict()
-            contact_list.append((
-                data.get("phone_number", ""),
-                data.get("client_name", "")
-            ))
-
+            contact_list.append((data.get("phone_number", ""), data.get("client_name", "")))
         return generate_standard_excel(contact_list)
     except Exception as e:
         logger.error(f"Error downloading full contact list: {str(e)}")
         return None, None
 
-# --- UI Tabs ---
+# -----------------------------
+# UI
+# -----------------------------
 tabs = st.tabs(["Upload & Sync", "Daily SMS List", "Dashboard", "Data Quality"])
 
 # --- Tab 1: Upload & Sync ---
@@ -629,17 +745,15 @@ with tabs[0]:
                     lambda row: "✅" if validate_contact(row["Phone"], row["Name"]) else "❌",
                     axis=1
                 )
-
                 st.subheader("Data Quality Preview")
                 st.dataframe(preview_df.head(50))
 
                 unique_count = len({p for p, _ in all_data if p})
-                st.success(f"Found {unique_count} unique contacts")
+                st.success(f"Found {unique_count} unique contacts.")
 
                 if st.button("Confirm Upload to Database"):
                     with st.spinner("Saving to database..."):
                         new_count, duplicate_count = save_to_firestore(all_data)
-
                     st.success(f"Added {new_count} new contacts; skipped {duplicate_count} duplicates.")
 
                     excel_file, df = generate_standard_excel(all_data)
@@ -654,7 +768,6 @@ with tabs[0]:
 
     st.subheader("Contact Management")
     col1, col2 = st.columns(2)
-
     with col1:
         if st.button("Download Full Contact List"):
             with st.spinner("Preparing full contact list..."):
@@ -672,18 +785,17 @@ with tabs[0]:
 
     with col2:
         if st.button("Refresh Contact Count"):
-            # Use count aggregation if available; else fallback
             try:
                 agg = db.collection("contacts").count().get()
-                # Firestore returns list of snapshots or a snapshot depending on SDK; normalize
                 if isinstance(agg, list):
                     count = agg[0][0].value
                 else:
+                    # try to get .value or nested aggregation result in some SDK variants
                     count = getattr(agg, "value", None) or getattr(getattr(agg, "aggregation_results", [{}])[0], "value", None)
                     if isinstance(count, dict) and "integerValue" in count:
                         count = int(count["integerValue"])
                 if count is None:
-                    raise ValueError("Count unavailable in this SDK; falling back.")
+                    raise ValueError("Count unavailable; falling back.")
             except Exception:
                 count = sum(1 for _ in db.collection("contacts").stream())
             st.metric("Total Contacts in Database", count)
@@ -716,7 +828,6 @@ with tabs[1]:
                     eligible = True
                     try:
                         if last_message:
-                            # Handle Firestore Timestamp or datetime
                             if hasattr(last_message, 'to_datetime'):
                                 last_dt = last_message.to_datetime()
                             else:
@@ -729,7 +840,7 @@ with tabs[1]:
                     if eligible:
                         sms_data.append((phone, name))
 
-                # Deduplicate and log
+                # Deduplicate and log queued messages
                 final_sms_data = []
                 seen_phones = set()
                 for phone, name in sms_data:
@@ -754,7 +865,6 @@ with tabs[1]:
 # --- Tab 3: Dashboard ---
 with tabs[2]:
     st.subheader("Message History Dashboard")
-
     col1, col2 = st.columns(2)
     with col1:
         start_date = st.date_input("Start date", datetime.now() - timedelta(days=30))
@@ -763,7 +873,6 @@ with tabs[2]:
 
     if st.button("Refresh Dashboard"):
         df_logs = load_message_logs((end_date - start_date).days)
-
         if df_logs.empty:
             st.info("No message logs found for selected period.")
         else:
@@ -811,7 +920,6 @@ with tabs[3]:
                 "duplicate_phones": defaultdict(int),
                 "phone_prefixes": defaultdict(int)
             }
-
             phone_counts = defaultdict(int)
 
             for doc in docs:
@@ -824,13 +932,12 @@ with tabs[3]:
 
                 if not validate_contact(phone, name or ""):
                     stats["invalid_phones"] += 1
-
                 if not (name or "").strip():
                     stats["missing_names"] += 1
 
                 if phone.startswith("+254") and len(phone) >= 6:
-                    prefix = phone[4:6]
-                    stats["phone_prefixes"][prefix] += 1
+                    pref2 = phone[4:6]  # shows '7x' or '1x'
+                    stats["phone_prefixes"][pref2] += 1
 
             stats["duplicate_count"] = sum(1 for count in phone_counts.values() if count > 1)
 
@@ -844,9 +951,7 @@ with tabs[3]:
 
             st.subheader("Phone Prefix Distribution")
             prefix_df = pd.DataFrame.from_dict(
-                stats["phone_prefixes"],
-                orient="index",
-                columns=["Count"]
+                stats["phone_prefixes"], orient="index", columns=["Count"]
             ).sort_values("Count", ascending=False)
             st.bar_chart(prefix_df)
 
@@ -854,9 +959,8 @@ with tabs[3]:
                 st.subheader("Sample Duplicate Entries")
                 duplicates = {p: c for p, c in phone_counts.items() if c > 1}
                 sample_dupes = list(duplicates.items())[:10]
-
                 for phone, count in sample_dupes:
                     st.write(f"{phone}: {count} occurrences")
-                    docs = contacts_ref.where("phone_number", "==", phone).stream()
-                    for doc in docs:
-                        st.write(f"- {doc.to_dict().get('client_name', 'No name')}")
+                    dlist = contacts_ref.where("phone_number", "==", phone).stream()
+                    for dd in dlist:
+                        st.write(f"- {dd.to_dict().get('client_name', 'No name')}")
