@@ -2,6 +2,7 @@
 # — Updated with robust phone/name extraction and bank-specific parser (Co-op & Equity)
 # — Fixes: openpyxl styling (no XlsxWriter calls), safer file-size, Firestore count fallback,
 #          batch-safe queries, better duplicate handling, and resilient PDF/CSV/Excel parsing.
+# — Added improved pattern for ~ separated phone/name format (e.g., ~254725691006~...~BRETTER MUNENE MITUNGA)
 
 import os
 import re
@@ -91,7 +92,7 @@ NAME_PATTERN = re.compile(rf'({NAME_TOKEN}(?:\s+{NAME_TOKEN}){{0,2}})')
 NOISE_TOKEN = re.compile(r'\b(?:MPESA|M-PESA|PAYBILL|TILL|ACC(?:OUNT)?|REF(?:ERENCE)?|BALANCE|CONFIRMATION|RECEIPT|SALES)\b', re.I)
 TXN_CODE = re.compile(r'\b[A-Z0-9]{8,12}\b')  # generic MPESA/Bank-like refs (e.g., TGU53XDSZD)
 
-# Typical MPESA refs start with letters (T...), include alphanumerics; we’ll search last code and take name after it
+# Typical MPESA refs start with letters (T...), include alphanumerics; we'll search last code and take name after it
 MPESA_CODE_CHUNK = re.compile(r'\bT[A-Z0-9]{8,}\b', re.I)
 
 EXCLUDE_WORDS_HARD = {"CDM", "CHEQUE"}
@@ -100,7 +101,7 @@ EXCLUDE_WORDS_SOFT = {"BANK", "TRANSFER", "LTD", "LIMITED", "INTERNATIONAL"}
 BLACKLISTED_NUMBERS = {"+254722000000", "+254000000000", "0766145780"}
 MAX_FILE_SIZE_MB = 10
 
-# Kenyan mobile prefixes: 07x and 01x (0110–0119, etc.). We’ll validate more generically.
+# Kenyan mobile prefixes: 07x and 01x (0110–0119, etc.). We'll validate more generically.
 def _valid_ke_prefix(digits12: str) -> bool:
     # digits12: '2547xxxxxxxx' or '2541xxxxxxxx'
     if len(digits12) != 12 or not digits12.startswith('254'):
@@ -349,7 +350,21 @@ def extract_from_bank_statement(df: pd.DataFrame):
             if not val.strip():
                 continue
 
-            # Find all phones in the narrative (often has two numbers: customer + agent/till)
+            # First try the improved pattern for ~ separated format
+            improved_pattern = re.compile(r'(?:~|\b)(254[17]\d{8})(?:~|\b).*?(?:~|\b)([A-Za-z][A-Za-z\s]+)(?=\s*~|\b|$)')
+            improved_matches = improved_pattern.findall(val)
+            
+            for phone, name in improved_matches:
+                formatted_phone = f"+{phone}"
+                if formatted_phone in seen:
+                    continue
+                cleaned_name = clean_name(name)
+                if validate_contact(formatted_phone, cleaned_name or ""):
+                    results.append((formatted_phone, cleaned_name))
+                    seen.add(formatted_phone)
+                continue  # Skip other processing if we found a match
+
+            # Fall back to original processing if improved pattern didn't match
             phones = BANK_PHONE_REGEX.findall(val)
             phones = [format_phone_number(p) for p in phones]
             phones = [p for p in phones if p]
@@ -357,25 +372,28 @@ def extract_from_bank_statement(df: pd.DataFrame):
             if not phones:
                 continue
 
-            # Use the first phone as customer phone
             phone = phones[0]
             if phone in seen:
                 continue
 
-            # Extract a name after the last MPESA-like code if present
+            # Handle the specific case where name comes after phone and MPESA code
             name_part = val
-            mpesa_codes = MPESA_CODE_CHUNK.findall(val)
-            if mpesa_codes:
-                last_code = mpesa_codes[-1]
-                idx = val.lower().rfind(last_code.lower())
-                if idx != -1:
-                    name_part = val[idx + len(last_code):]
+            if '~' in val:
+                parts = val.split('~')
+                for i, part in enumerate(parts):
+                    if phone[1:] in part:  # phone without '+'
+                        # Look ahead for name in next parts
+                        for j in range(i+1, len(parts)):
+                            if re.match(r'^[A-Za-z]', parts[j]):
+                                name_part = parts[j]
+                                break
+                        break
 
             name = clean_name(name_part)
 
-            # If no decent name found, try stripping leading tokens like "MPS 2547..."
+            # If no decent name found, try alternative patterns
             if not name:
-                m = re.search(r'\b(?:MPS|MPESA|M-PESA)\b\s*(.*)$', val, re.I)
+                m = re.search(rf'{re.escape(phone[1:])}[^A-Za-z]*([A-Za-z][A-Za-z\s]+)', val)
                 if m:
                     name = clean_name(m.group(1))
 
