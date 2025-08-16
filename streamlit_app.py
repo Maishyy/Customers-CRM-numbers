@@ -1,8 +1,9 @@
 # streamlit_app.py
-# — Updated with robust phone/name extraction and bank-specific parser (Co-op & Equity)
-# — Fixes: openpyxl styling (no XlsxWriter calls), safer file-size, Firestore count fallback,
-#          batch-safe queries, better duplicate handling, and resilient PDF/CSV/Excel parsing.
-# — Added improved pattern for ~ separated phone/name format (e.g., ~254725691006~...~BRETTER MUNENE MITUNGA)
+# Updated with:
+# 1. Multi-file upload support in Daily SMS tab
+# 2. Improved business logic for customer messaging eligibility
+# 3. 14-day cooldown period for existing customers
+# 4. Automatic new customer registration
 
 import os
 import re
@@ -820,65 +821,116 @@ with tabs[0]:
 
 # --- Tab 2: Daily SMS List ---
 with tabs[1]:
-    st.subheader("Generate Daily SMS List (Active customers only)")
-    uploaded_file = st.file_uploader(
-        "Upload today's statement",
+    st.subheader("Generate Daily SMS List")
+    
+    # Configurable parameters
+    with st.expander("Messaging Settings"):
+        COOLDOWN_DAYS = st.slider(
+            "Minimum days between messages", 
+            min_value=1, 
+            max_value=30, 
+            value=14,
+            help="Customers won't receive messages more frequently than this"
+        )
+        INCLUDE_NEW = st.checkbox(
+            "Always include new customers", 
+            value=True,
+            help="Automatically add phone numbers not in our database"
+        )
+    
+    # Multi-file uploader
+    uploaded_files = st.file_uploader(
+        "Upload today's statements",
         type=["pdf", "csv", "xls", "xlsx"],
+        accept_multiple_files=True,
         key="daily_sms_uploader"
     )
 
-    if uploaded_file and st.button("Generate Today's List"):
-        with st.spinner("Processing statement..."):
-            current_data = process_file_with_duplicate_checks(uploaded_file)
-            current_numbers = {p for p, _ in current_data if p}
-
-            if not current_data:
-                st.warning("No valid contacts found in this statement")
-            else:
-                last_messages = get_last_message_dates(list(current_numbers))
-
-                sms_data = []
-                now = datetime.now()
-                for phone, name in current_data:
-                    if not phone:
-                        continue
-                    last_message = last_messages.get(phone)
-                    eligible = True
-                    try:
-                        if last_message:
-                            if hasattr(last_message, 'to_datetime'):
-                                last_dt = last_message.to_datetime()
-                            else:
-                                last_dt = last_message if isinstance(last_message, datetime) else None
-                            if last_dt:
-                                eligible = (now - last_dt).days > 7
-                    except Exception:
-                        eligible = True
-
-                    if eligible:
-                        sms_data.append((phone, name))
-
-                # Deduplicate and log queued messages
-                final_sms_data = []
-                seen_phones = set()
-                for phone, name in sms_data:
-                    if phone not in seen_phones:
-                        final_sms_data.append((phone, name))
-                        seen_phones.add(phone)
-                        log_message(phone, name)
-
-                if final_sms_data:
-                    sms_excel, sms_df = generate_standard_excel(final_sms_data)
-                    st.success(f"{len(final_sms_data)} active contacts ready for messaging.")
-                    st.download_button(
-                        "Download SMS List",
-                        data=sms_excel,
-                        file_name=f"sms_list_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                    st.dataframe(sms_df)
+    if uploaded_files and st.button("Generate Today's SMS List"):
+        with st.spinner("Processing statements..."):
+            # Process all files and combine contacts
+            all_contacts = []
+            for file in uploaded_files:
+                file_contacts = process_file_with_duplicate_checks(file)
+                all_contacts.extend(file_contacts)
+            
+            # Remove duplicates from combined list
+            unique_contacts = {p: n for p, n in all_contacts if p}
+            st.info(f"Processed {len(uploaded_files)} files with {len(unique_contacts)} unique contacts")
+            
+            # Prepare Firestore operations
+            sms_list = []
+            batch = db.batch()
+            contacts_ref = db.collection("contacts")
+            now = datetime.now()
+            
+            # Process each contact
+            for phone, name in unique_contacts.items():
+                doc_ref = contacts_ref.document(phone.replace("+", ""))
+                
+                # Try to get existing record
+                doc = doc_ref.get()
+                
+                eligible = False
+                if doc.exists:
+                    # Existing customer - check last transaction date
+                    last_trans = doc.to_dict().get("last_transaction_date")
+                    if isinstance(last_trans, datetime):
+                        delta = now - last_trans
+                        eligible = delta.days > COOLDOWN_DAYS
+                    else:
+                        eligible = True  # if field missing, include to be safe
                 else:
-                    st.info("No eligible contacts to message today from this statement.")
+                    # New customer - check if we should include
+                    eligible = INCLUDE_NEW
+                
+                if eligible:
+                    sms_list.append((phone, name))
+                    
+                    # Prepare update data
+                    update_data = {
+                        "last_transaction_date": firestore.SERVER_TIMESTAMP,
+                        "phone_number": phone,
+                        "client_name": name
+                    }
+                    
+                    # Additional fields for new customers
+                    if not doc.exists:
+                        name_parts = name.split() if name else []
+                        update_data.update({
+                            "first_name": name_parts[0] if name_parts else "",
+                            "last_name": " ".join(name_parts[1:]) if len(name_parts) > 1 else "",
+                            "source": "upload",
+                            "timestamp": firestore.SERVER_TIMESTAMP
+                        })
+                    
+                    # Queue the update
+                    batch.set(doc_ref, update_data, merge=True)
+            
+            # Commit all updates
+            batch.commit()
+            
+            # Log messages for eligible contacts
+            for phone, name in sms_list:
+                log_message(phone, name)
+            
+            # Show results
+            if sms_list:
+                st.success(f"{len(sms_list)} contacts eligible for messaging (cooldown: {COOLDOWN_DAYS} days)")
+                
+                # Generate downloadable report
+                sms_excel, sms_df = generate_standard_excel(sms_list)
+                st.download_button(
+                    "Download SMS List",
+                    data=sms_excel,
+                    file_name=f"sms_list_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                
+                # Show preview
+                st.dataframe(sms_df)
+            else:
+                st.info("No eligible contacts to message today from these statements.")
 
 # --- Tab 3: Dashboard ---
 with tabs[2]:
