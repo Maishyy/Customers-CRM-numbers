@@ -12,7 +12,7 @@ def build_upload_report_rows(all_data, existing_numbers):
         rows.append({
             "Name": name,
             "Phone": phone,
-            "Exists in Database": "Yes" if phone in existing_numbers else "No",
+            "Existing": "Yes" if phone in existing_numbers else "No",
         })
     return rows
 
@@ -47,8 +47,8 @@ def render_upload_tab(db):
                 st.dataframe(preview_df.head(50))
 
                 unique_count = len({p for p, _ in all_data if p})
-                existing_count = sum(1 for row in report_rows if row["Exists in Database"] == "Yes")
-                new_count_preview = sum(1 for row in report_rows if row["Exists in Database"] == "No")
+                existing_count = sum(1 for row in report_rows if row["Existing"] == "Yes")
+                new_count_preview = sum(1 for row in report_rows if row["Existing"] == "No")
                 st.success(f"Found {unique_count} unique contacts.")
                 st.caption(f"Existing in database: {existing_count} | New to database: {new_count_preview}")
 
