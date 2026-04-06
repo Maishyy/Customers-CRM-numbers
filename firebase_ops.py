@@ -11,6 +11,22 @@ from processors import generate_standard_excel
 
 logger = logging.getLogger(__name__)
 
+def get_existing_phone_numbers(db):
+    """Return all phone numbers currently stored in Firestore."""
+    existing_numbers = set()
+    if not db:
+        return existing_numbers
+
+    try:
+        for doc in db.collection("contacts").select(["phone_number"]).stream():
+            phone = doc.get("phone_number")
+            if phone:
+                existing_numbers.add(phone)
+    except Exception as e:
+        logger.warning(f"Could not load existing phone numbers: {e}")
+
+    return existing_numbers
+
 def save_to_firestore(db, data):
     """Save contacts to Firestore with duplicate prevention."""
     if not db or not data:

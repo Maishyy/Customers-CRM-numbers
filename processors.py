@@ -14,6 +14,15 @@ from utils import format_phone_number, clean_name, validate_contact, safe_file_s
 
 logger = logging.getLogger(__name__)
 
+COOP_NARRATION_PATTERN = re.compile(
+    r'~\s*(254[17]\d{8})\s*~[^~]*~\s*([A-Za-z][A-Za-z\'\-\s]+?)(?=\s*(?:~|$))',
+    re.I,
+)
+FAMILY_REMARKS_PATTERN = re.compile(
+    r'\bFrom\s+(254[17]\d{8})\s+([A-Za-z][A-Za-z\'\-\s]+?)(?=\s+Alias\s+Code\b|$)',
+    re.I,
+)
+
 def should_exclude_line(line: str, has_phone: bool) -> bool:
     """Exclude headers or noise lines."""
     if not isinstance(line, str):
@@ -203,6 +212,37 @@ def extract_from_bank_statement(df: pd.DataFrame):
 
     return results
 
+def extract_structured_statement_contacts(df: pd.DataFrame):
+    """Scan likely text-bearing Excel cells for known statement formats."""
+    results = []
+    seen = set()
+
+    for _, row in df.iterrows():
+        for value in row.values.tolist():
+            if pd.isna(value):
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+
+            matches = []
+            matches.extend(COOP_NARRATION_PATTERN.findall(text))
+            matches.extend(FAMILY_REMARKS_PATTERN.findall(text))
+
+            if not matches:
+                continue
+
+            for phone_digits, raw_name in matches:
+                phone = format_phone_number(phone_digits)
+                name = clean_name(raw_name)
+                if not phone or phone in seen:
+                    continue
+                if validate_contact(phone, name or ""):
+                    results.append((phone, name))
+                    seen.add(phone)
+
+    return results
+
 def extract_from_dataframe(df: pd.DataFrame):
     records = []
     for _, row in df.iterrows():
@@ -240,6 +280,7 @@ def process_pdf(file):
             progress_bar = st.progress(0)
             contacts = []
             seen_numbers = set()
+            extracted_text_chars = 0
 
             pages = pdf.pages
 
@@ -249,11 +290,17 @@ def process_pdf(file):
                 except Exception:
                     txt = ""
                 if txt:
+                    extracted_text_chars += len(txt.strip())
                     for phone, name in extract_contacts(txt):
                         if phone and phone not in seen_numbers:
                             contacts.append((phone, name))
                             seen_numbers.add(phone)
                 progress_bar.progress((i + 1) / len(pages))
+            if not contacts and extracted_text_chars == 0:
+                st.warning(
+                    "This PDF appears to contain little or no extractable text. "
+                    "It may be a scanned/image-based statement and could require OCR."
+                )
             return contacts
     except Exception as e:
         logger.error(f"PDF processing error: {str(e)}")
@@ -280,6 +327,9 @@ def process_excel(file):
         output = []
         for sheet_name, df in dfs.items():
             cols_lower = [str(c).lower() for c in df.columns]
+            structured_hits = extract_structured_statement_contacts(df)
+            if structured_hits:
+                output.extend(structured_hits)
             if any('narrative' in c for c in cols_lower) or _guess_narrative_columns(df):
                 output.extend(extract_from_bank_statement(df))
             else:
@@ -335,7 +385,30 @@ def generate_standard_excel(data):
     """Generate standardized Excel output with openpyxl styling."""
     formatted_data = []
     seen = set()
-    for phone, name in data:
+    for item in data:
+        if isinstance(item, dict):
+            phone = item.get("Phone") or item.get("phone_number") or item.get("Phone or Email") or ""
+            name = item.get("Name") or item.get("client_name") or ""
+            phone = phone if str(phone).startswith("+") else format_phone_number(phone) or str(phone)
+            if phone in seen:
+                continue
+            seen.add(phone)
+
+            row = dict(item)
+            clean_phone = phone.replace("+", "") if phone else ""
+            if "Firstname(optional)" not in row or "Lastname(optional)" not in row:
+                parts = str(name).strip().split() if name else []
+                row.setdefault("Firstname(optional)", parts[0] if parts else "")
+                row.setdefault("Lastname(optional)", " ".join(parts[1:]) if len(parts) > 1 else "")
+            row.setdefault("Name", name)
+            row.setdefault("Phone", phone)
+            row.setdefault("Phone or Email", clean_phone)
+            row.setdefault("phone(254)", clean_phone)
+            row.setdefault("Valid", "Yes" if validate_contact(phone, str(name)) else "No")
+            formatted_data.append(row)
+            continue
+
+        phone, name = item
         if phone in seen:
             continue
         seen.add(phone)

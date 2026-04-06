@@ -1,11 +1,20 @@
-# tabs/upload_tab.py
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
 from config import MAX_FILE_SIZE_MB
-from firebase_ops import download_full_contact_list, save_to_firestore
+from firebase_ops import download_full_contact_list, get_existing_phone_numbers, save_to_firestore
 from processors import generate_standard_excel, process_file, process_files_parallel
 from utils import safe_file_size, validate_contact
+
+def build_upload_report_rows(all_data, existing_numbers):
+    rows = []
+    for phone, name in all_data:
+        rows.append({
+            "Name": name,
+            "Phone": phone,
+            "Exists in Database": "Yes" if phone in existing_numbers else "No",
+        })
+    return rows
 
 def render_upload_tab(db):
     st.subheader("Upload MPESA or Bank Statements")
@@ -25,23 +34,38 @@ def render_upload_tab(db):
                 all_data = process_files_parallel(uploaded_files) if len(uploaded_files) > 1 else process_file(uploaded_files[0])
 
             if all_data:
-                preview_df = pd.DataFrame(all_data, columns=["Phone", "Name"])
+                existing_numbers = get_existing_phone_numbers(db)
+                report_rows = build_upload_report_rows(all_data, existing_numbers)
+
+                preview_df = pd.DataFrame(report_rows)
                 preview_df["Valid"] = preview_df.apply(
-                    lambda row: "✅" if validate_contact(row["Phone"], row["Name"]) else "❌",
+                    lambda row: "Yes" if validate_contact(row["Phone"], row["Name"]) else "No",
                     axis=1
                 )
+
                 st.subheader("Data Quality Preview")
                 st.dataframe(preview_df.head(50))
 
                 unique_count = len({p for p, _ in all_data if p})
+                existing_count = sum(1 for row in report_rows if row["Exists in Database"] == "Yes")
+                new_count_preview = sum(1 for row in report_rows if row["Exists in Database"] == "No")
                 st.success(f"Found {unique_count} unique contacts.")
+                st.caption(f"Existing in database: {existing_count} | New to database: {new_count_preview}")
+
+                report_excel, _ = generate_standard_excel(report_rows)
+                st.download_button(
+                    "Download Extraction Report",
+                    data=report_excel,
+                    file_name="extraction_report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
 
                 if st.button("Confirm Upload to Database"):
                     with st.spinner("Saving to database..."):
                         new_count, duplicate_count = save_to_firestore(db, all_data)
                     st.success(f"Added {new_count} new contacts; skipped {duplicate_count} duplicates.")
 
-                    excel_file, df = generate_standard_excel(all_data)
+                    excel_file, df = generate_standard_excel(report_rows)
                     st.download_button(
                         "Download Processed Contacts",
                         data=excel_file,
