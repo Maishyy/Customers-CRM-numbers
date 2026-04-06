@@ -1,0 +1,103 @@
+# tabs/sms_tab.py
+import streamlit as st
+from datetime import datetime
+
+from config import COOLDOWN_DAYS
+from processors import process_file_with_duplicate_checks
+from firebase_ops import log_message
+from utils import validate_contact
+
+def render_sms_tab(db):
+    st.subheader("Generate Daily SMS List")
+    
+    with st.expander("Messaging Settings"):
+        cooldown_days = st.slider(
+            "Minimum days between messages", 
+            min_value=1, 
+            max_value=30, 
+            value=COOLDOWN_DAYS,
+            help="Customers won't receive messages more frequently than this"
+        )
+        include_new = st.checkbox(
+            "Always include new customers", 
+            value=True,
+            help="Automatically add phone numbers not in our database"
+        )
+    
+    uploaded_files = st.file_uploader(
+        "Upload today's statements",
+        type=["pdf", "csv", "xls", "xlsx"],
+        accept_multiple_files=True,
+        key="daily_sms_uploader"
+    )
+
+    if uploaded_files and st.button("Generate Today's SMS List"):
+        with st.spinner("Processing statements..."):
+            all_contacts = []
+            for file in uploaded_files:
+                file_contacts = process_file_with_duplicate_checks(file)
+                all_contacts.extend(file_contacts)
+            
+            unique_contacts = {p: n for p, n in all_contacts if p}
+            st.info(f"Processed {len(uploaded_files)} files with {len(unique_contacts)} unique contacts")
+            
+            sms_list = []
+            batch = db.batch()
+            contacts_ref = db.collection("contacts")
+            now = datetime.now()
+            
+            for phone, name in unique_contacts.items():
+                doc_ref = contacts_ref.document(phone.replace("+", ""))
+                doc = doc_ref.get()
+                
+                eligible = False
+                if doc.exists:
+                    last_trans = doc.to_dict().get("last_transaction_date")
+                    if isinstance(last_trans, datetime):
+                        delta = now - last_trans
+                        eligible = delta.days > cooldown_days
+                    else:
+                        eligible = True
+                else:
+                    eligible = include_new
+                
+                if eligible:
+                    sms_list.append((phone, name))
+                    
+                    update_data = {
+                        "last_transaction_date": firestore.SERVER_TIMESTAMP,
+                        "phone_number": phone,
+                        "client_name": name
+                    }
+                    
+                    if not doc.exists:
+                        name_parts = name.split() if name else []
+                        update_data.update({
+                            "first_name": name_parts[0] if name_parts else "",
+                            "last_name": " ".join(name_parts[1:]) if len(name_parts) > 1 else "",
+                            "source": "upload",
+                            "timestamp": firestore.SERVER_TIMESTAMP
+                        })
+                    
+                    batch.set(doc_ref, update_data, merge=True)
+            
+            batch.commit()
+            
+            for phone, name in sms_list:
+                log_message(db, phone, name)
+            
+            if sms_list:
+                st.success(f"{len(sms_list)} contacts eligible for messaging (cooldown: {cooldown_days} days)")
+                
+                from processors import generate_standard_excel
+                sms_excel, sms_df = generate_standard_excel(sms_list)
+                st.download_button(
+                    "Download SMS List",
+                    data=sms_excel,
+                    file_name=f"sms_list_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                
+                st.dataframe(sms_df)
+            else:
+                st.info("No eligible contacts to message today from these statements.")
