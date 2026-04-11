@@ -1,6 +1,7 @@
 # main.py
 import streamlit as st
 import logging
+from auth import require_login
 from firebase_setup import setup_firebase
 from tabs.upload_tab import render_upload_tab
 from tabs.sms_tab import render_sms_tab
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 st.set_page_config(layout="wide", page_title="Sequid Hardware Contact System")
 
 def main():
+    require_login()
+
     # Setup Firebase
     db = setup_firebase()
     if db is None:

@@ -22,6 +22,7 @@ import pdfplumber
 
 import firebase_admin
 from firebase_admin import credentials, firestore
+from auth import require_login
 
 # -----------------------------
 # Streamlit page config
@@ -35,6 +36,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(), logging.FileHandler("app.log")]
 )
 logger = logging.getLogger(__name__)
+
+require_login()
 
 # -----------------------------
 # Firebase Setup
