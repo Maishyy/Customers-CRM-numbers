@@ -23,6 +23,9 @@ import pdfplumber
 import firebase_admin
 from firebase_admin import credentials, firestore
 from auth import require_login
+from firebase_ops import get_existing_phone_numbers as shared_get_existing_phone_numbers
+from firebase_ops import log_upload_run as shared_log_upload_run
+from tabs.dashboard_tab import render_dashboard_tab as shared_render_dashboard_tab
 
 # -----------------------------
 # Streamlit page config
@@ -769,6 +772,16 @@ with tabs[0]:
                 )
                 st.subheader("Data Quality Preview")
                 st.dataframe(preview_df.head(50))
+                existing_numbers = shared_get_existing_phone_numbers(db)
+                report_rows = []
+                for phone, name in all_data:
+                    report_rows.append({
+                        "Name": name,
+                        "Phone": phone,
+                        "Existing": "Yes" if phone in existing_numbers else "No",
+                        "Valid": "Yes" if validate_contact(phone, name) else "No"
+                    })
+                preview_df = pd.DataFrame(report_rows)
 
                 unique_count = len({p for p, _ in all_data if p})
                 st.success(f"Found {unique_count} unique contacts.")
@@ -776,9 +789,10 @@ with tabs[0]:
                 if st.button("Confirm Upload to Database"):
                     with st.spinner("Saving to database..."):
                         new_count, duplicate_count = save_to_firestore(all_data)
+                        shared_log_upload_run(db, uploaded_files, report_rows, new_count, duplicate_count)
                     st.success(f"Added {new_count} new contacts; skipped {duplicate_count} duplicates.")
 
-                    excel_file, df = generate_standard_excel(all_data)
+                    excel_file, df = generate_standard_excel(report_rows)
                     st.download_button(
                         "Download Processed Contacts",
                         data=excel_file,
@@ -828,18 +842,21 @@ with tabs[1]:
     
     # Configurable parameters
     with st.expander("Messaging Settings"):
+        NEW_CUSTOMERS_ONLY = st.checkbox(
+            "Only include new customers",
+            value=True,
+            help="When enabled, only phone numbers not already in the database will be included."
+        )
         COOLDOWN_DAYS = st.slider(
             "Minimum days between messages", 
             min_value=1, 
             max_value=30, 
             value=14,
-            help="Customers won't receive messages more frequently than this"
+            help="Customers won't receive messages more frequently than this",
+            disabled=NEW_CUSTOMERS_ONLY
         )
-        INCLUDE_NEW = st.checkbox(
-            "Always include new customers", 
-            value=True,
-            help="Automatically add phone numbers not in our database"
-        )
+        if NEW_CUSTOMERS_ONLY:
+            st.caption("Cooldown is ignored while sending to new customers only.")
     
     # Multi-file uploader
     uploaded_files = st.file_uploader(
@@ -875,7 +892,9 @@ with tabs[1]:
                 doc = doc_ref.get()
                 
                 eligible = False
-                if doc.exists:
+                if NEW_CUSTOMERS_ONLY:
+                    eligible = not doc.exists
+                elif doc.exists:
                     # Existing customer - check last transaction date
                     last_trans = doc.to_dict().get("last_transaction_date")
                     if isinstance(last_trans, datetime):
@@ -884,8 +903,7 @@ with tabs[1]:
                     else:
                         eligible = True  # if field missing, include to be safe
                 else:
-                    # New customer - check if we should include
-                    eligible = INCLUDE_NEW
+                    eligible = True
                 
                 if eligible:
                     sms_list.append((phone, name))
@@ -919,7 +937,10 @@ with tabs[1]:
             
             # Show results
             if sms_list:
-                st.success(f"{len(sms_list)} contacts eligible for messaging (cooldown: {COOLDOWN_DAYS} days)")
+                if NEW_CUSTOMERS_ONLY:
+                    st.success(f"{len(sms_list)} new customers eligible for messaging.")
+                else:
+                    st.success(f"{len(sms_list)} contacts eligible for messaging (cooldown: {COOLDOWN_DAYS} days)")
                 
                 # Generate downloadable report
                 sms_excel, sms_df = generate_standard_excel(sms_list)
@@ -933,49 +954,14 @@ with tabs[1]:
                 # Show preview
                 st.dataframe(sms_df)
             else:
-                st.info("No eligible contacts to message today from these statements.")
+                if NEW_CUSTOMERS_ONLY:
+                    st.info("No new customers found to message from these statements.")
+                else:
+                    st.info("No eligible contacts to message today from these statements.")
 
 # --- Tab 3: Dashboard ---
 with tabs[2]:
-    st.subheader("Message History Dashboard")
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start date", datetime.now() - timedelta(days=30))
-    with col2:
-        end_date = st.date_input("End date", datetime.now())
-
-    if st.button("Refresh Dashboard"):
-        df_logs = load_message_logs((end_date - start_date).days)
-        if df_logs.empty:
-            st.info("No message logs found for selected period.")
-        else:
-            total_messages = len(df_logs)
-            unique_contacts = df_logs["Phone"].nunique()
-            success_rate = len(df_logs[df_logs["Status"].str.lower() == "delivered"]) / total_messages if total_messages else 0
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Messages", total_messages)
-            c2.metric("Unique Contacts", unique_contacts)
-            c3.metric("Success Rate", f"{success_rate:.1%}")
-
-            st.subheader("Message Volume")
-            daily_counts = df_logs.groupby("Date Messaged").size()
-            st.bar_chart(daily_counts)
-
-            st.subheader("Top Recipients")
-            top_contacts = df_logs["Phone"].value_counts().nlargest(10)
-            st.bar_chart(top_contacts)
-
-            st.subheader("Message Log")
-            st.dataframe(df_logs.sort_values("Date Messaged", ascending=False))
-
-            csv = df_logs.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download Full Log CSV",
-                data=csv,
-                file_name="message_log.csv",
-                mime="text/csv"
-            )
+    shared_render_dashboard_tab(db)
 
 # --- Tab 4: Data Quality ---
 with tabs[3]:

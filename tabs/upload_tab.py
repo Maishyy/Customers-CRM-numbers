@@ -2,17 +2,19 @@ import pandas as pd
 import streamlit as st
 
 from config import MAX_FILE_SIZE_MB
-from firebase_ops import download_full_contact_list, get_existing_phone_numbers, save_to_firestore
+from firebase_ops import download_full_contact_list, get_existing_phone_numbers, log_upload_run, save_to_firestore
 from processors import generate_standard_excel, process_file, process_files_parallel
 from utils import safe_file_size, validate_contact
 
 def build_upload_report_rows(all_data, existing_numbers):
     rows = []
     for phone, name in all_data:
+        is_valid = validate_contact(phone, name)
         rows.append({
             "Name": name,
             "Phone": phone,
             "Existing": "Yes" if phone in existing_numbers else "No",
+            "Valid": "Yes" if is_valid else "No",
         })
     return rows
 
@@ -38,10 +40,6 @@ def render_upload_tab(db):
                 report_rows = build_upload_report_rows(all_data, existing_numbers)
 
                 preview_df = pd.DataFrame(report_rows)
-                preview_df["Valid"] = preview_df.apply(
-                    lambda row: "Yes" if validate_contact(row["Phone"], row["Name"]) else "No",
-                    axis=1
-                )
 
                 st.subheader("Data Quality Preview")
                 st.dataframe(preview_df.head(50))
@@ -63,6 +61,7 @@ def render_upload_tab(db):
                 if st.button("Confirm Upload to Database"):
                     with st.spinner("Saving to database..."):
                         new_count, duplicate_count = save_to_firestore(db, all_data)
+                        log_upload_run(db, uploaded_files, report_rows, new_count, duplicate_count)
                     st.success(f"Added {new_count} new contacts; skipped {duplicate_count} duplicates.")
 
                     excel_file, df = generate_standard_excel(report_rows)

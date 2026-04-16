@@ -11,18 +11,21 @@ def render_sms_tab(db):
     st.subheader("Generate Daily SMS List")
 
     with st.expander("Messaging Settings"):
+        new_customers_only = st.checkbox(
+            "Only include new customers",
+            value=True,
+            help="When enabled, only phone numbers not already in the database will be included."
+        )
         cooldown_days = st.slider(
             "Minimum days between messages",
             min_value=1,
             max_value=30,
             value=COOLDOWN_DAYS,
-            help="Customers won't receive messages more frequently than this"
+            help="Customers won't receive messages more frequently than this",
+            disabled=new_customers_only
         )
-        include_new = st.checkbox(
-            "Always include new customers",
-            value=True,
-            help="Automatically add phone numbers not in our database"
-        )
+        if new_customers_only:
+            st.caption("Cooldown is ignored while sending to new customers only.")
 
     uploaded_files = st.file_uploader(
         "Upload today's statements",
@@ -51,7 +54,9 @@ def render_sms_tab(db):
                 doc = doc_ref.get()
 
                 eligible = False
-                if doc.exists:
+                if new_customers_only:
+                    eligible = not doc.exists
+                elif doc.exists:
                     last_trans = doc.to_dict().get("last_transaction_date")
                     if isinstance(last_trans, datetime):
                         delta = now - last_trans
@@ -59,7 +64,7 @@ def render_sms_tab(db):
                     else:
                         eligible = True
                 else:
-                    eligible = include_new
+                    eligible = True
 
                 if eligible:
                     sms_list.append((phone, name))
@@ -87,7 +92,10 @@ def render_sms_tab(db):
                 log_message(db, phone, name)
 
             if sms_list:
-                st.success(f"{len(sms_list)} contacts eligible for messaging (cooldown: {cooldown_days} days)")
+                if new_customers_only:
+                    st.success(f"{len(sms_list)} new customers eligible for messaging.")
+                else:
+                    st.success(f"{len(sms_list)} contacts eligible for messaging (cooldown: {cooldown_days} days)")
 
                 sms_excel, sms_df = generate_standard_excel(sms_list)
                 st.download_button(
@@ -99,4 +107,7 @@ def render_sms_tab(db):
 
                 st.dataframe(sms_df)
             else:
-                st.info("No eligible contacts to message today from these statements.")
+                if new_customers_only:
+                    st.info("No new customers found to message from these statements.")
+                else:
+                    st.info("No eligible contacts to message today from these statements.")

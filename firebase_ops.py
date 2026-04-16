@@ -11,6 +11,18 @@ from processors import generate_standard_excel
 
 logger = logging.getLogger(__name__)
 
+def _normalize_timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if hasattr(value, "to_datetime"):
+        try:
+            return value.to_datetime()
+        except Exception:
+            return None
+    return None
+
 def get_existing_phone_numbers(db):
     """Return all phone numbers currently stored in Firestore."""
     existing_numbers = set()
@@ -92,6 +104,41 @@ def log_message(db, phone, name):
     except Exception as e:
         logger.error(f"Failed to log message for {phone}: {str(e)}")
 
+def log_upload_run(db, files, report_rows, new_count, duplicate_count):
+    """Store upload summary data for dashboard insights."""
+    if not db:
+        return
+
+    try:
+        valid_count = sum(1 for row in report_rows if row.get("Valid") == "Yes")
+        unique_contacts = len({row.get("Phone") for row in report_rows if row.get("Phone")})
+        existing_count = sum(1 for row in report_rows if row.get("Existing") == "Yes")
+        new_to_db_count = sum(1 for row in report_rows if row.get("Existing") == "No")
+        file_entries = []
+        source_types = []
+
+        for file in files or []:
+            name = getattr(file, "name", "")
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else "unknown"
+            file_entries.append({"name": name, "type": ext})
+            source_types.append(ext)
+
+        db.collection("upload_runs").add({
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "file_count": len(file_entries),
+            "files": file_entries,
+            "source_types": source_types,
+            "extracted_contacts": len(report_rows),
+            "unique_contacts": unique_contacts,
+            "valid_contacts": valid_count,
+            "existing_contacts": existing_count,
+            "new_contacts_in_upload": new_to_db_count,
+            "added_to_database": new_count,
+            "duplicates_skipped": duplicate_count,
+        })
+    except Exception as e:
+        logger.warning(f"Failed to log upload run: {e}")
+
 def load_message_logs(db, days=30):
     try:
         cutoff = datetime.now() - timedelta(days=days)
@@ -112,6 +159,8 @@ def load_message_logs(db, days=30):
                     date_str = ""
             data.append({
                 "Phone": phone,
+                "Name": d.get("client_name", ""),
+                "Timestamp": _normalize_timestamp(ts),
                 "Date Messaged": date_str,
                 "Status": d.get("status", "unknown")
             })
@@ -119,6 +168,52 @@ def load_message_logs(db, days=30):
     except Exception as e:
         logger.error(f"Error loading logs: {str(e)}")
         return pd.DataFrame(columns=["Phone", "Date Messaged", "Status"])
+
+def load_contacts_dataframe(db):
+    try:
+        rows = []
+        for doc in db.collection("contacts").stream():
+            d = doc.to_dict()
+            rows.append({
+                "Phone": d.get("phone_number", ""),
+                "Name": d.get("client_name", ""),
+                "Created At": _normalize_timestamp(d.get("timestamp")),
+                "Last Transaction": _normalize_timestamp(d.get("last_transaction_date")),
+                "Source": d.get("source", ""),
+            })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        logger.error(f"Error loading contacts dataframe: {str(e)}")
+        return pd.DataFrame(columns=["Phone", "Name", "Created At", "Last Transaction", "Source"])
+
+def load_upload_runs(db, days=90):
+    try:
+        cutoff = datetime.now() - timedelta(days=days)
+        rows = []
+        docs = db.collection("upload_runs").where("timestamp", ">=", cutoff).stream()
+        for doc in docs:
+            d = doc.to_dict()
+            rows.append({
+                "Timestamp": _normalize_timestamp(d.get("timestamp")),
+                "File Count": d.get("file_count", 0),
+                "Source Types": d.get("source_types", []),
+                "Extracted Contacts": d.get("extracted_contacts", 0),
+                "Unique Contacts": d.get("unique_contacts", 0),
+                "Valid Contacts": d.get("valid_contacts", 0),
+                "Existing Contacts": d.get("existing_contacts", 0),
+                "New Contacts In Upload": d.get("new_contacts_in_upload", 0),
+                "Added To Database": d.get("added_to_database", 0),
+                "Duplicates Skipped": d.get("duplicates_skipped", 0),
+                "Files": d.get("files", []),
+            })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        logger.error(f"Error loading upload runs: {str(e)}")
+        return pd.DataFrame(columns=[
+            "Timestamp", "File Count", "Source Types", "Extracted Contacts",
+            "Unique Contacts", "Valid Contacts", "Existing Contacts",
+            "New Contacts In Upload", "Added To Database", "Duplicates Skipped", "Files"
+        ])
 
 def get_last_message_dates(db, phone_numbers):
     last_messages = {}
