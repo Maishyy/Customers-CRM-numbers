@@ -139,6 +139,108 @@ def log_upload_run(db, files, report_rows, new_count, duplicate_count):
     except Exception as e:
         logger.warning(f"Failed to log upload run: {e}")
 
+def apply_sms_delivery_report(db, report_rows, files=None):
+    """Apply SMS delivery report categories to contacts without deleting history."""
+    if not db or not report_rows:
+        return {
+            "processed": 0,
+            "created": 0,
+            "updated": 0,
+            "suppressed": 0,
+            "skipped": 0,
+            "unrecognized": 0,
+        }
+
+    contacts_ref = db.collection("contacts")
+    batch = db.batch()
+    stats = {
+        "processed": 0,
+        "created": 0,
+        "updated": 0,
+        "suppressed": 0,
+        "skipped": 0,
+        "unrecognized": 0,
+    }
+    writes = 0
+
+    for row in report_rows:
+        phone = row.get("Phone")
+        category = row.get("Category")
+        if not phone:
+            stats["skipped"] += 1
+            continue
+        if category == "unrecognized":
+            stats["unrecognized"] += 1
+            continue
+
+        doc_ref = contacts_ref.document(phone.replace("+", ""))
+        doc = doc_ref.get()
+        exists = doc.exists
+
+        # Failed report rows should suppress existing contacts, but should not create new contacts.
+        if category == "failed" and not exists:
+            stats["skipped"] += 1
+            continue
+
+        update_data = {
+            "phone_number": phone,
+            "sms_last_status": row.get("Delivery Status", ""),
+            "sms_last_raw_status": row.get("Raw Status", ""),
+            "sms_category": category,
+            "sms_last_report_date": firestore.SERVER_TIMESTAMP,
+            "promotional_allowed": bool(row.get("Promotional Allowed")),
+            "non_promotional_allowed": bool(row.get("Non Promotional Allowed")),
+            "sms_suppressed": bool(row.get("Suppressed")),
+        }
+
+        if category == "failed":
+            update_data["sms_suppression_reason"] = row.get("Delivery Status", "")
+            stats["suppressed"] += 1
+        else:
+            update_data["sms_suppression_reason"] = ""
+
+        if not exists:
+            update_data.update({
+                "client_name": "",
+                "first_name": "",
+                "last_name": "",
+                "source": "sms_report",
+                "timestamp": firestore.SERVER_TIMESTAMP,
+                "last_transaction_date": firestore.SERVER_TIMESTAMP,
+            })
+            stats["created"] += 1
+        else:
+            stats["updated"] += 1
+
+        batch.set(doc_ref, update_data, merge=True)
+        writes += 1
+        stats["processed"] += 1
+
+        if writes % 500 == 0:
+            batch.commit()
+            batch = db.batch()
+
+    if writes % 500 != 0:
+        batch.commit()
+
+    try:
+        file_entries = []
+        for file in files or []:
+            name = getattr(file, "name", "")
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else "unknown"
+            file_entries.append({"name": name, "type": ext})
+
+        db.collection("sms_report_imports").add({
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "files": file_entries,
+            "rows_read": len(report_rows),
+            **stats,
+        })
+    except Exception as e:
+        logger.warning(f"Failed to log SMS report import: {e}")
+
+    return stats
+
 def load_message_logs(db, days=30):
     try:
         cutoff = datetime.now() - timedelta(days=days)

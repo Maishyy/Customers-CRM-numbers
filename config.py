@@ -9,6 +9,10 @@ BLACKLISTED_NUMBERS = {
     "+254722000000", "254722000000", "0722000000"
 }
 
+SMS_PROMOTIONAL_STATUSES = {"DeliveredToTerminal", "SentToNetwork"}
+SMS_NON_PROMOTIONAL_STATUSES = {"SenderName Blacklisted"}
+SMS_FAILED_STATUSES = {"AbsentSubscriber", "DeliveryImpossible", "Unknown"}
+
 # Regex patterns
 PHONE_FLEX = re.compile(
     r'(?:\+?254|0)?\s*(?:7\d{2}|1[0-9]\d)\s*[\s-]?\d{3}[\s-]?\d{3}'

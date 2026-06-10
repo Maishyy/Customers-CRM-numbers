@@ -9,7 +9,16 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-from config import PHONE_FLEX, BANK_PHONE_REGEX, NAME_PATTERN, EXCLUDE_WORDS_HARD, EXCLUDE_WORDS_SOFT
+from config import (
+    PHONE_FLEX,
+    BANK_PHONE_REGEX,
+    NAME_PATTERN,
+    EXCLUDE_WORDS_HARD,
+    EXCLUDE_WORDS_SOFT,
+    SMS_FAILED_STATUSES,
+    SMS_NON_PROMOTIONAL_STATUSES,
+    SMS_PROMOTIONAL_STATUSES,
+)
 from utils import format_phone_number, clean_name, validate_contact, safe_file_size
 
 logger = logging.getLogger(__name__)
@@ -22,6 +31,11 @@ FAMILY_REMARKS_PATTERN = re.compile(
     r'\bFrom\s+(254[17]\d{8})\s+([A-Za-z][A-Za-z\'\-\s]+?)(?=\s+Alias\s+Code\b|$)',
     re.I,
 )
+
+SMS_STATUS_LOOKUP = {
+    status.lower().replace(" ", ""): status
+    for status in SMS_PROMOTIONAL_STATUSES | SMS_NON_PROMOTIONAL_STATUSES | SMS_FAILED_STATUSES
+}
 
 def should_exclude_line(line: str, has_phone: bool) -> bool:
     """Exclude headers or noise lines."""
@@ -380,6 +394,95 @@ def process_file_with_duplicate_checks(file):
     except Exception as e:
         logger.error(f"Error in duplicate check: {str(e)}")
         return []
+
+def classify_sms_delivery_status(status):
+    canonical = SMS_STATUS_LOOKUP.get(str(status or "").strip().lower().replace(" ", ""))
+    if canonical in SMS_PROMOTIONAL_STATUSES:
+        return canonical, "promotional"
+    if canonical in SMS_NON_PROMOTIONAL_STATUSES:
+        return canonical, "non_promotional"
+    if canonical in SMS_FAILED_STATUSES:
+        return canonical, "failed"
+    return str(status or "").strip(), "unrecognized"
+
+def _find_sms_report_columns(df):
+    normalized = {str(c).strip().lower(): c for c in df.columns}
+
+    phone_col = None
+    for key, col in normalized.items():
+        if key in {"phone number", "phone", "msisdn", "mobile", "recipient"}:
+            phone_col = col
+            break
+    if phone_col is None:
+        for col in df.columns:
+            sample = " ".join(df[col].dropna().astype(str).head(20).tolist())
+            if re.search(r'\b(?:254|0)?[17]\d{8}\b', sample):
+                phone_col = col
+                break
+
+    status_col = None
+    for key, col in normalized.items():
+        if key in {"delivery description", "status", "delivery status", "description"}:
+            status_col = col
+            break
+    if status_col is None:
+        for col in df.columns:
+            values = df[col].dropna().astype(str).head(50).tolist()
+            hits = sum(1 for value in values if classify_sms_delivery_status(value)[1] != "unrecognized")
+            if hits:
+                status_col = col
+                break
+
+    return phone_col, status_col
+
+def parse_sms_delivery_report(file):
+    name = (getattr(file, "name", "") or "").lower()
+    try:
+        if name.endswith(".csv"):
+            frames = [pd.read_csv(file)]
+        elif name.endswith((".xls", ".xlsx")):
+            frames = list(_read_excel_all_sheets(file).values())
+        else:
+            raise ValueError("Unsupported SMS report format")
+    except Exception as e:
+        logger.error(f"SMS report read error: {str(e)}")
+        st.error(f"Error reading SMS report: {str(e)}")
+        return [], []
+
+    rows = []
+    issues = []
+    seen = set()
+
+    for df in frames:
+        phone_col, status_col = _find_sms_report_columns(df)
+        if phone_col is None or status_col is None:
+            issues.append("Could not find phone/status columns in one sheet.")
+            continue
+
+        for _, row in df.iterrows():
+            phone = format_phone_number(row.get(phone_col, ""))
+            raw_status = row.get(status_col, "")
+            canonical_status, category = classify_sms_delivery_status(raw_status)
+
+            if not phone:
+                continue
+
+            dedupe_key = (phone, canonical_status)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            rows.append({
+                "Phone": phone,
+                "Raw Status": str(raw_status or "").strip(),
+                "Delivery Status": canonical_status,
+                "Category": category,
+                "Promotional Allowed": category == "promotional",
+                "Non Promotional Allowed": category in {"promotional", "non_promotional"},
+                "Suppressed": category == "failed",
+            })
+
+    return rows, issues
 
 def generate_standard_excel(data):
     """Generate standardized Excel output with openpyxl styling."""
