@@ -61,7 +61,8 @@ def render_sms_tab(db):
                     st.success(
                         "SMS report applied: "
                         f"{stats['created']} created, {stats['updated']} updated, "
-                        f"{stats['suppressed']} suppressed, {stats['skipped']} skipped."
+                        f"{stats['suppressed']} suppressed, {stats['skipped']} skipped. "
+                        f"{stats.get('messages_updated', 0)} queued message logs resolved."
                     )
                     if stats["unrecognized"]:
                         st.warning(f"{stats['unrecognized']} rows had unrecognized statuses and were not applied.")
@@ -109,6 +110,7 @@ def render_sms_tab(db):
 
             sms_list = []
             batch = db.batch()
+            batch_writes = 0
             contacts_ref = db.collection("contacts")
             now = datetime.now()
 
@@ -166,8 +168,15 @@ def render_sms_tab(db):
                         })
 
                     batch.set(doc_ref, update_data, merge=True)
+                    batch_writes += 1
 
-            batch.commit()
+                    # Firestore batches are limited to 500 writes.
+                    if batch_writes % 500 == 0:
+                        batch.commit()
+                        batch = db.batch()
+
+            if batch_writes % 500 != 0:
+                batch.commit()
 
             for phone, name in sms_list:
                 log_message(db, phone, name)

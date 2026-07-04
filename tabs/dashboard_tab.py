@@ -198,6 +198,19 @@ def render_dashboard_tab(db):
         c3.metric("Recipients Messaged More Than Once", repeat_recipients)
 
         if not message_filtered.empty:
+            status_counts = message_filtered["Status"].str.lower().value_counts()
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Delivered", int(status_counts.get("delivered", 0)))
+            s2.metric("Failed", int(status_counts.get("failed", 0)))
+            s3.metric("Blocked", int(status_counts.get("blocked", 0)))
+            s4.metric("Still Queued", int(status_counts.get("queued", 0)))
+            if int(status_counts.get("queued", 0)):
+                st.caption(
+                    "Queued messages resolve to delivered/failed/blocked when you apply "
+                    "an SMS delivery report in the Daily SMS List tab."
+                )
+
+        if not message_filtered.empty:
             message_volume = message_filtered.copy()
             message_volume["Date"] = message_volume["Timestamp"].dt.date.astype(str)
             daily_messages = message_volume.groupby("Date").size().sort_index()

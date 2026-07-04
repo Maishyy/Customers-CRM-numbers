@@ -1,9 +1,6 @@
-streamlit
-pandas
-openpyxl
-xlrd
-pdfplumber
-firebase-admin
-altair
-tqdm
-matplotlib
+streamlit==1.45.1
+pandas==2.2.3
+openpyxl==3.1.2
+xlrd==2.0.1
+pdfplumber==0.11.6
+firebase-admin==6.9.0

@@ -4,9 +4,10 @@ import re
 # Constants
 MAX_FILE_SIZE_MB = 10
 COOLDOWN_DAYS = 14
+# Entries must be in normalized +254 form: format_phone_number checks this set
+# only after converting the raw input to +254XXXXXXXXX.
 BLACKLISTED_NUMBERS = {
-    "+254722000000", "+254000000000", "0766145780", 
-    "+254722000000", "254722000000", "0722000000"
+    "+254722000000", "+254000000000", "+254766145780",
 }
 
 SMS_PROMOTIONAL_STATUSES = {"DeliveredToTerminal", "SentToNetwork"}

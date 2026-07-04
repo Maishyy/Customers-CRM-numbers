@@ -41,6 +41,9 @@ def setup_firebase():
             )
             return None
     else:
+        # A previous Test Mode session may have pointed this process at the
+        # emulator; clear it so production traffic reaches real Firestore.
+        os.environ.pop("FIRESTORE_EMULATOR_HOST", None)
         try:
             if "firebase_creds" not in st.secrets:
                 raise KeyError("Missing 'firebase_creds' in Streamlit secrets.")
