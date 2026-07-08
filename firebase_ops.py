@@ -213,8 +213,12 @@ def update_message_statuses_from_report(db, report_rows):
 
     return updated
 
-def apply_sms_delivery_report(db, report_rows, files=None):
-    """Apply SMS delivery report categories to contacts without deleting history."""
+def apply_sms_delivery_report(db, report_rows, files=None, existing_numbers=None):
+    """Apply SMS delivery report categories to contacts without deleting history.
+
+    Pass existing_numbers (a set of +254... strings) to decide
+    created-vs-updated from memory instead of one Firestore read per row.
+    """
     if not db or not report_rows:
         return {
             "processed": 0,
@@ -225,6 +229,11 @@ def apply_sms_delivery_report(db, report_rows, files=None):
             "unrecognized": 0,
             "messages_updated": 0,
         }
+
+    if existing_numbers is not None:
+        # Copy so created contacts can be tracked without mutating the
+        # caller's (possibly cached) set.
+        existing_numbers = set(existing_numbers)
 
     contacts_ref = db.collection("contacts")
     batch = db.batch()
@@ -250,8 +259,10 @@ def apply_sms_delivery_report(db, report_rows, files=None):
             continue
 
         doc_ref = contacts_ref.document(phone.replace("+", ""))
-        doc = doc_ref.get()
-        exists = doc.exists
+        if existing_numbers is not None:
+            exists = phone in existing_numbers
+        else:
+            exists = doc_ref.get().exists
 
         # Failed report rows should suppress existing contacts, but should not create new contacts.
         if category == "failed" and not exists:
@@ -285,6 +296,8 @@ def apply_sms_delivery_report(db, report_rows, files=None):
                 "last_transaction_date": firestore.SERVER_TIMESTAMP,
             })
             stats["created"] += 1
+            if existing_numbers is not None:
+                existing_numbers.add(phone)
         else:
             stats["updated"] += 1
 

@@ -139,6 +139,25 @@ class TestApplySmsDeliveryReport:
         assert logged[0]["rows_read"] == 1
         assert "messages_updated" in logged[0]
 
+    def test_existing_numbers_set_avoids_per_row_reads(self):
+        db = FakeDB({"254712345678": {
+            "phone_number": "+254712345678", "client_name": "John",
+        }})
+        stats = apply_sms_delivery_report(
+            db,
+            [
+                self.row("+254712345678", "promotional"),
+                self.row("+254798765432", "promotional"),
+                # Same new phone again with a failed status: must count as
+                # an update of the row created above, not a skip.
+                self.row("+254798765432", "failed", "AbsentSubscriber"),
+            ],
+            existing_numbers={"+254712345678"},
+        )
+        assert stats["updated"] == 2
+        assert stats["created"] == 1
+        assert stats["skipped"] == 0
+
     def test_large_report_chunked_at_500(self):
         db = FakeDB()
         rows = [self.row(make_phone(i), "promotional") for i in range(600)]
