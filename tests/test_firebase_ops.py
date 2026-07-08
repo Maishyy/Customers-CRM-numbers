@@ -45,6 +45,18 @@ class TestSaveToFirestore:
         assert save_to_firestore(FakeDB(), []) == (0, 0)
         assert save_to_firestore(None, [("+254712345678", "J")]) == (0, 0)
 
+    def test_caller_supplied_existing_numbers_skip_prefetch(self):
+        # When the caller passes the existing set, no collection scan runs
+        # and duplicates are still detected.
+        db = FakeDB({"254712345678": {"phone_number": "+254712345678"}})
+        new, dupes = save_to_firestore(
+            db,
+            [("+254712345678", "John"), ("+254798765432", "Jane Wanjiku")],
+            existing_numbers={"+254712345678"},
+        )
+        assert (new, dupes) == (1, 1)
+        assert "254798765432" in db.stores["contacts"]
+
     def test_batches_are_chunked_at_500(self):
         db = FakeDB()
         data = [(make_phone(i), "Test User") for i in range(600)]

@@ -2,18 +2,52 @@
 import pandas as pd
 import streamlit as st
 
+import re
+
+from data_cache import clear_caches, contacts_dataframe
 from firebase_ops import (
     add_contact_note,
     add_manual_contact,
-    find_contacts,
     get_contact,
     get_message_history,
     load_contact_notes,
-    load_contacts_dataframe,
     update_contact,
 )
 from processors import generate_standard_excel
 from tabs.dashboard_tab import _coerce_datetime
+
+
+def search_contacts(contacts_df, query, limit=50):
+    """Filter the contacts dataframe by phone fragment or name.
+
+    Pure function over the cached dataframe so searching costs no
+    database reads. Returns a list of (phone, name) tuples.
+    """
+    query = (query or "").strip().lower()
+    if not query or contacts_df.empty:
+        return []
+
+    digits = re.sub(r"\D", "", query)
+    phones = contacts_df["Phone"].fillna("")
+    names = contacts_df["Name"].fillna("")
+
+    if digits:
+        # Stored numbers are +254...; searches typed in local 07xx/01xx
+        # format must match them too.
+        variants = {digits}
+        if digits.startswith("0"):
+            variants.add("254" + digits[1:])
+        phone_digits = phones.str.replace(r"\D", "", regex=True)
+        mask = phone_digits.apply(lambda p: any(v in p for v in variants))
+    else:
+        mask = names.str.lower().str.contains(re.escape(query), na=False)
+
+    matched = contacts_df[mask].head(limit)
+    return [
+        (row_phone, row_name or "")
+        for row_phone, row_name in zip(matched["Phone"], matched["Name"])
+        if row_phone
+    ]
 
 
 def _segment_definitions(contacts_df, now):
@@ -55,7 +89,7 @@ def _render_segments(db):
         return
 
     with st.spinner("Loading contacts..."):
-        contacts_df = load_contacts_dataframe(db)
+        contacts_df = contacts_dataframe(db)
 
     if contacts_df.empty:
         st.info("No contacts in the database yet.")
@@ -134,6 +168,7 @@ def _render_profile(db, phone):
             elif not suppressed:
                 fields["sms_suppression_reason"] = ""
             if update_contact(db, phone, fields):
+                clear_caches()
                 st.success("Contact updated.")
                 st.rerun()
             else:
@@ -180,14 +215,14 @@ def render_customers_tab(db):
 
     if query and len(query.strip()) >= 3:
         with st.spinner("Searching..."):
-            matches = find_contacts(db, query)
+            matches = search_contacts(contacts_dataframe(db), query)
 
         if not matches:
             st.info("No contacts matched your search.")
         else:
             options = {
-                f"{m.get('phone_number', '?')} — {m.get('client_name') or 'Unnamed'}": m.get("phone_number")
-                for m in matches if m.get("phone_number")
+                f"{phone} — {name or 'Unnamed'}": phone
+                for phone, name in matches
             }
             selection = st.selectbox("Select a customer", list(options.keys()))
             if selection:
@@ -204,6 +239,7 @@ def render_customers_tab(db):
             if st.form_submit_button("Add Contact"):
                 ok, message = add_manual_contact(db, raw_phone, raw_name)
                 if ok:
+                    clear_caches()
                     st.success(message)
                 else:
                     st.error(message)

@@ -5,6 +5,7 @@ from datetime import datetime
 from firebase_admin import firestore
 
 from config import COOLDOWN_DAYS
+from data_cache import clear_caches
 from firebase_ops import apply_sms_delivery_report, log_message
 from processors import generate_standard_excel, parse_sms_delivery_report, process_file_with_duplicate_checks
 
@@ -58,6 +59,7 @@ def render_sms_tab(db):
                 if st.button("Apply SMS Report to Database"):
                     with st.spinner("Updating contact SMS statuses..."):
                         stats = apply_sms_delivery_report(db, report_rows, report_files)
+                        clear_caches()
                     st.success(
                         "SMS report applied: "
                         f"{stats['created']} created, {stats['updated']} updated, "
@@ -177,6 +179,7 @@ def render_sms_tab(db):
 
             if batch_writes % 500 != 0:
                 batch.commit()
+            clear_caches()
 
             for phone, name in sms_list:
                 log_message(db, phone, name)

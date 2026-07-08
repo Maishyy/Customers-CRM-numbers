@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 
-from firebase_ops import load_contacts_dataframe, load_message_logs, load_upload_runs
+from data_cache import contacts_dataframe, message_logs, upload_runs
 
 def _coerce_datetime(series):
     if series.empty:
@@ -43,9 +43,9 @@ def render_dashboard_tab(db):
         now = pd.Timestamp.now()
         days = max((end_dt - start_dt).days, 1)
 
-        contacts_df = load_contacts_dataframe(db)
-        message_df = load_message_logs(db, days + 30)
-        upload_df = load_upload_runs(db, max(days + 30, 90))
+        contacts_df = contacts_dataframe(db)
+        message_df = message_logs(db, days + 30)
+        upload_df = upload_runs(db, max(days + 30, 90))
 
         if contacts_df.empty and message_df.empty and upload_df.empty:
             st.info("No dashboard data available yet.")

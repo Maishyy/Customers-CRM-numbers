@@ -48,8 +48,12 @@ def get_existing_phone_numbers(db):
 
     return existing_numbers
 
-def save_to_firestore(db, data):
-    """Save contacts to Firestore with duplicate prevention."""
+def save_to_firestore(db, data, existing_numbers=None):
+    """Save contacts to Firestore with duplicate prevention.
+
+    Pass existing_numbers (a set of +254... strings) to skip the
+    full-collection prefetch when the caller already has it.
+    """
     if not db or not data:
         return 0, 0
 
@@ -59,12 +63,15 @@ def save_to_firestore(db, data):
     duplicate_count = 0
     writes = 0
 
-    existing_numbers = set()
-    try:
-        for doc in coll.select(["phone_number"]).stream():
-            existing_numbers.add(doc.get("phone_number"))
-    except Exception as e:
-        logger.warning(f"Prefetch existing numbers failed: {e}")
+    if existing_numbers is None:
+        existing_numbers = set()
+        try:
+            for doc in coll.select(["phone_number"]).stream():
+                existing_numbers.add(doc.get("phone_number"))
+        except Exception as e:
+            logger.warning(f"Prefetch existing numbers failed: {e}")
+    else:
+        existing_numbers = set(existing_numbers)
 
     for phone, name in {(p, n) for p, n in data if p}:
         if not validate_contact_strict(phone, name):
@@ -405,35 +412,6 @@ def get_contact(db, phone):
     except Exception as e:
         logger.error(f"Error fetching contact {phone}: {e}")
         return None
-
-def find_contacts(db, query, limit=50):
-    """Search contacts by phone fragment or name (case-insensitive)."""
-    query = (query or "").strip().lower()
-    if not query:
-        return []
-
-    digits = re.sub(r"\D", "", query)
-    # Stored numbers are +254...; searches typed in local 07xx/01xx format
-    # must match them too.
-    digit_variants = {digits}
-    if digits.startswith("0"):
-        digit_variants.add("254" + digits[1:])
-
-    matches = []
-    try:
-        for doc in db.collection("contacts").stream():
-            d = doc.to_dict()
-            phone_digits = re.sub(r"\D", "", d.get("phone_number", "") or "")
-            name = (d.get("client_name", "") or "").lower()
-            phone_hit = digits and any(v in phone_digits for v in digit_variants)
-            name_hit = not digits and query in name
-            if phone_hit or name_hit:
-                matches.append(d)
-                if len(matches) >= limit:
-                    break
-    except Exception as e:
-        logger.error(f"Contact search failed: {e}")
-    return matches
 
 def update_contact(db, phone, fields):
     """Update a whitelisted set of contact fields; derives first/last name."""

@@ -2,7 +2,8 @@ import pandas as pd
 import streamlit as st
 
 from config import MAX_FILE_SIZE_MB
-from firebase_ops import download_full_contact_list, get_existing_phone_numbers, log_upload_run, save_to_firestore
+from data_cache import clear_caches, existing_phone_numbers
+from firebase_ops import download_full_contact_list, log_upload_run, save_to_firestore
 from processors import generate_standard_excel, process_file, process_files_parallel
 from utils import safe_file_size, validate_contact
 
@@ -36,7 +37,7 @@ def render_upload_tab(db):
                 all_data = process_files_parallel(uploaded_files) if len(uploaded_files) > 1 else process_file(uploaded_files[0])
 
             if all_data:
-                existing_numbers = get_existing_phone_numbers(db)
+                existing_numbers = existing_phone_numbers(db)
                 report_rows = build_upload_report_rows(all_data, existing_numbers)
 
                 preview_df = pd.DataFrame(report_rows)
@@ -60,8 +61,11 @@ def render_upload_tab(db):
 
                 if st.button("Confirm Upload to Database"):
                     with st.spinner("Saving to database..."):
-                        new_count, duplicate_count = save_to_firestore(db, all_data)
+                        new_count, duplicate_count = save_to_firestore(
+                            db, all_data, existing_numbers=existing_numbers
+                        )
                         log_upload_run(db, uploaded_files, report_rows, new_count, duplicate_count)
+                        clear_caches()
                     st.success(f"Added {new_count} new contacts; skipped {duplicate_count} duplicates.")
 
                     excel_file, df = generate_standard_excel(report_rows)

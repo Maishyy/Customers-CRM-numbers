@@ -8,7 +8,6 @@ from firebase_ops import (
     add_contact_note,
     add_manual_contact,
     apply_sms_delivery_report,
-    find_contacts,
     get_contact,
     get_message_history,
     load_contact_notes,
@@ -100,38 +99,6 @@ class TestGetContact:
 
     def test_missing(self):
         assert get_contact(FakeDB(), "+254712345678") is None
-
-
-class TestFindContacts:
-    def _db(self):
-        return FakeDB({
-            "254712345678": {"phone_number": "+254712345678", "client_name": "John Kamau"},
-            "254798765432": {"phone_number": "+254798765432", "client_name": "Jane Wanjiku"},
-        })
-
-    def test_search_by_phone_fragment(self):
-        matches = find_contacts(self._db(), "0712345")
-        assert len(matches) == 1
-        assert matches[0]["client_name"] == "John Kamau"
-
-    def test_search_by_name_case_insensitive(self):
-        matches = find_contacts(self._db(), "jane")
-        assert len(matches) == 1
-        assert matches[0]["phone_number"] == "+254798765432"
-
-    def test_no_match(self):
-        assert find_contacts(self._db(), "nonexistent") == []
-
-    def test_empty_query(self):
-        assert find_contacts(self._db(), "  ") == []
-
-    def test_limit_respected(self):
-        db = FakeDB({
-            make_phone(i).replace("+", ""): {
-                "phone_number": make_phone(i), "client_name": "Bulk User",
-            } for i in range(80)
-        })
-        assert len(find_contacts(db, "bulk", limit=50)) == 50
 
 
 class TestUpdateContact:
