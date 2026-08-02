@@ -2,10 +2,10 @@ import pandas as pd
 import streamlit as st
 
 from config import MAX_FILE_SIZE_MB
-from data_cache import clear_caches, existing_phone_numbers
+from data_cache import clear_caches, existing_phone_numbers, last_upload_run
 from firebase_ops import download_full_contact_list, log_upload_run, save_to_firestore
 from processors import generate_standard_excel, process_file, process_files_parallel
-from utils import safe_file_size, validate_contact
+from utils import format_relative_time, safe_file_size, validate_contact
 
 def build_upload_report_rows(all_data, existing_numbers):
     rows = []
@@ -19,8 +19,20 @@ def build_upload_report_rows(all_data, existing_numbers):
         })
     return rows
 
+def render_last_upload_status(db):
+    run = last_upload_run(db)
+    if not run or not run.get("Timestamp"):
+        st.caption("No uploads yet.")
+        return
+    when = format_relative_time(run["Timestamp"])
+    st.caption(
+        f"Last upload: **{when}** — {run.get('Extracted Contacts', 0)} contacts extracted, "
+        f"{run.get('Added To Database', 0)} added to database."
+    )
+
 def render_upload_tab(db):
     st.subheader("Upload MPESA or Bank Statements")
+    render_last_upload_status(db)
     uploaded_files = st.file_uploader(
         "Upload files",
         type=["pdf", "csv", "xls", "xlsx"],
@@ -67,6 +79,7 @@ def render_upload_tab(db):
                         log_upload_run(db, uploaded_files, report_rows, new_count, duplicate_count)
                         clear_caches()
                     st.success(f"Added {new_count} new contacts; skipped {duplicate_count} duplicates.")
+                    render_last_upload_status(db)
 
                     excel_file, df = generate_standard_excel(report_rows)
                     st.download_button(

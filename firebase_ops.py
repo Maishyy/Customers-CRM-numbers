@@ -385,6 +385,34 @@ def load_contacts_dataframe(db):
             "Transactions", "Suppressed", "SMS Category",
         ])
 
+def get_last_upload_run(db):
+    """Return the most recent upload/extraction run as a dict, or None.
+
+    Uses order_by + limit(1) so it costs a single document read instead
+    of scanning the whole upload_runs collection.
+    """
+    if not db:
+        return None
+    try:
+        docs = (
+            db.collection("upload_runs")
+            .order_by("timestamp", direction=firestore.Query.DESCENDING)
+            .limit(1)
+            .stream()
+        )
+        for doc in docs:
+            d = doc.to_dict()
+            return {
+                "Timestamp": _normalize_timestamp(d.get("timestamp")),
+                "File Count": d.get("file_count", 0),
+                "Extracted Contacts": d.get("extracted_contacts", 0),
+                "Added To Database": d.get("added_to_database", 0),
+            }
+        return None
+    except Exception as e:
+        logger.error(f"Error loading last upload run: {str(e)}")
+        return None
+
 def load_upload_runs(db, days=90):
     try:
         cutoff = datetime.now() - timedelta(days=days)

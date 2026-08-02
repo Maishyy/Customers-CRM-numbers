@@ -39,16 +39,27 @@ class FakeDocRef:
 
 
 class FakeQuery:
-    def __init__(self, db, coll_path, filters=None):
+    def __init__(self, db, coll_path, filters=None, order=None, limit_n=None):
         self._db = db
         self._coll_path = coll_path
         self._filters = filters or []
+        self._order = order
+        self._limit_n = limit_n
 
     def where(self, field, op, value):
-        return FakeQuery(self._db, self._coll_path, self._filters + [(field, op, value)])
+        return FakeQuery(
+            self._db, self._coll_path, self._filters + [(field, op, value)],
+            self._order, self._limit_n,
+        )
 
     def select(self, fields):
         return self
+
+    def order_by(self, field, direction=None):
+        return FakeQuery(self._db, self._coll_path, self._filters, (field, direction), self._limit_n)
+
+    def limit(self, n):
+        return FakeQuery(self._db, self._coll_path, self._filters, self._order, n)
 
     def _matches(self, data):
         for field, op, value in self._filters:
@@ -65,11 +76,18 @@ class FakeQuery:
 
     def stream(self):
         store = self._db.store_for(self._coll_path)
-        return [
+        results = [
             FakeSnapshot(doc_id, data, FakeDocRef(self._db, self._coll_path, doc_id))
             for doc_id, data in list(store.items())
             if self._matches(data)
         ]
+        if self._order:
+            field, direction = self._order
+            reverse = direction == "DESCENDING"
+            results.sort(key=lambda snap: snap.get(field), reverse=reverse)
+        if self._limit_n is not None:
+            results = results[: self._limit_n]
+        return results
 
 
 class FakeCollection(FakeQuery):

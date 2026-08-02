@@ -1,6 +1,8 @@
 # utils.py
 import re
 import logging
+from datetime import datetime
+
 from config import BLACKLISTED_NUMBERS
 
 logger = logging.getLogger(__name__)
@@ -93,6 +95,36 @@ def validate_contact_strict(phone, name):
     if len(set(digits)) < 4:
         return False
     return True
+
+def format_relative_time(then: datetime, now: datetime = None) -> str:
+    """Human-friendly "time ago" string, e.g. '5 minutes ago', 'Yesterday'."""
+    if then is None:
+        return "Never"
+
+    now = now or datetime.now()
+    if then.tzinfo is not None and now.tzinfo is None:
+        then = then.replace(tzinfo=None)
+
+    delta = now - then
+    seconds = delta.total_seconds()
+
+    if seconds < 0:
+        return "Just now"
+    if seconds < 60:
+        return "Just now"
+    if seconds < 3600:
+        minutes = int(seconds // 60)
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    if seconds < 86400:
+        hours = int(seconds // 3600)
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+
+    days = delta.days
+    if days == 1:
+        return "Yesterday"
+    if days < 7:
+        return f"{days} days ago"
+    return then.strftime("%Y-%m-%d")
 
 def safe_file_size(uploaded_file) -> int:
     """Return file size in bytes in a Streamlit-version-safe way."""
